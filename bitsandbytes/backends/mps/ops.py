@@ -16,6 +16,7 @@ from typing import Optional
 import torch
 
 from ..._ops import register_kernel
+from ...cextension import get_mps_library
 from ..default.ops import (
     _dequantize_4bit_compute,
     _get_4bit_quantize_bounds,
@@ -24,6 +25,28 @@ from ..default.ops import (
 from ..utils import _get_4bit_code
 
 _QUANT_MAP = {"fp4": 1, "nf4": 2}
+
+# Native hand-written Metal library (None when not built / metallib absent).
+_mps_native = get_mps_library()
+
+
+def _native_available() -> bool:
+    """Whether the native Metal quantize_blockwise kernel is usable on this install."""
+    return _mps_native is not None
+
+
+def _ensure_native_buffer(t: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous, storage_offset==0 tensor.
+
+    The native dispatch treats ``tensor.data_ptr()`` as an ``id<MTLBuffer>`` and binds it
+    at offset 0, which is only valid for a fresh (offset-0) allocation. A view into a
+    larger buffer is cloned to guarantee that.
+    """
+    t = t.contiguous()
+    if t.storage_offset() != 0:
+        t = t.clone()
+    return t
+
 
 _kernel = None
 
@@ -81,8 +104,41 @@ def _quantize_blockwise_compute(
     return lo.to(torch.uint8), absmax
 
 
+def _quantize_blockwise_native(
+    A: torch.Tensor, code: torch.Tensor, blocksize: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route quantize_blockwise through the hand-written Metal kernel.
+
+    Mirrors the reference math exactly (per-block absmax, reciprocal-scale, searchsorted
+    into the code table). Inputs are forced to fp32/offset-0 to match the kernel's ABI.
+    torch.mps.synchronize() flushes torch's stream so the native command buffer (on a
+    separate queue) reads materialized inputs; the .mm blocks on completion before return.
+    """
+    A_flat = _ensure_native_buffer(A.reshape(-1).to(torch.float32))
+    code_f = _ensure_native_buffer(code.to(torch.float32))
+
+    n = A_flat.numel()
+    blocks = -(n // -blocksize)
+    out = torch.empty(n, dtype=torch.uint8, device=A.device)
+    absmax = torch.empty(blocks, dtype=torch.float32, device=A.device)
+
+    torch.mps.synchronize()
+    _mps_native.bnb_mps_quantize_blockwise(
+        code_f.data_ptr(),
+        A_flat.data_ptr(),
+        out.data_ptr(),
+        absmax.data_ptr(),
+        n,
+        blocksize,
+    )
+
+    return out.reshape(A.shape), absmax
+
+
 @register_kernel("bitsandbytes::quantize_blockwise", "mps")
 def _(A: torch.Tensor, code: torch.Tensor, blocksize: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if _native_available():
+        return _quantize_blockwise_native(A, code, blocksize)
     q, absmax = _quantize_blockwise_compute(A.reshape(-1).float(), code.float(), blocksize)
     return q.reshape(A.shape), absmax
 

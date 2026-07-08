@@ -20,6 +20,8 @@ Tolerances (empirically calibrated on torch 2.12.1 / macOS 26.4.1, see
 The whole module skips when MPS is not available.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -28,6 +30,19 @@ import bitsandbytes.functional as F
 from tests.helpers import describe_dtype, id_formatter
 
 pytestmark = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is not available")
+
+# Whether the hand-written Metal quantize_blockwise kernel is built and loaded on this
+# machine. Set BNB_MPS_REQUIRE_NATIVE=1 to make the build-verification tests fail loudly
+# (rather than skip) when the native library did not load -- used to gate a source build.
+try:
+    import bitsandbytes.backends.mps.ops as _mps_ops
+
+    _NATIVE_AVAILABLE = _mps_ops._native_available()
+except Exception:
+    _mps_ops = None
+    _NATIVE_AVAILABLE = False
+
+_REQUIRE_NATIVE = os.environ.get("BNB_MPS_REQUIRE_NATIVE") == "1"
 
 FLOAT_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 BLOCKSIZES = [64, 128, 256, 512]
@@ -109,9 +124,7 @@ class TestBlockwise8bitParity:
 
         A_mps = A.to("mps")
         q_mps, absmax_mps = torch.ops.bitsandbytes.quantize_blockwise(A_mps, code.to("mps"), blocksize)
-        dq_mps = torch.ops.bitsandbytes.dequantize_blockwise(
-            q_mps, absmax_mps, code.to("mps"), blocksize, dtype
-        )
+        dq_mps = torch.ops.bitsandbytes.dequantize_blockwise(q_mps, absmax_mps, code.to("mps"), blocksize, dtype)
 
         err_cpu = (dq_cpu.float() - A.float()).abs().mean().item()
         err_mps = (dq_mps.cpu().float() - A.float()).abs().mean().item()
@@ -120,6 +133,86 @@ class TestBlockwise8bitParity:
         # garbage" would be ~1.0. The MPS error must also track the oracle closely.
         assert err_mps < 0.05, f"MPS roundtrip error {err_mps} implausibly high"
         assert err_mps == pytest.approx(err_cpu, rel=0.02)
+
+
+class TestNativeMetalPath:
+    """Phase-2 verification: quantize_blockwise through the hand-written Metal kernel.
+
+    These assert the native path is exercised (not a fallback) and stays bit-exact vs the
+    CPU oracle. When the native library is not built, they skip -- unless
+    BNB_MPS_REQUIRE_NATIVE=1, which turns the missing library into a hard failure so a
+    source-build verification run cannot silently pass on the fallback.
+    """
+
+    def test_native_library_loaded(self):
+        if not _NATIVE_AVAILABLE:
+            if _REQUIRE_NATIVE:
+                pytest.fail(
+                    "BNB_MPS_REQUIRE_NATIVE=1 but the native MPS library did not load. "
+                    "Build it: cmake -DCOMPUTE_BACKEND=mps -S . -B . && cmake --build . --config Release"
+                )
+            pytest.skip("Native MPS library not built (using Hub/pure-torch fallback).")
+        from bitsandbytes.cextension import get_mps_library
+
+        assert get_mps_library() is not None
+
+    @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
+    @pytest.mark.parametrize("blocksize", BLOCKSIZES)
+    def test_quantize_blockwise_native_bit_exact(self, dtype, blocksize):
+        if not _NATIVE_AVAILABLE:
+            if _REQUIRE_NATIVE:
+                pytest.fail("BNB_MPS_REQUIRE_NATIVE=1 but native path unavailable.")
+            pytest.skip("Native MPS library not built.")
+
+        torch.manual_seed(1337)
+        A = torch.randn(1024, 1024, dtype=dtype)
+        code = F.create_dynamic_map().to(torch.float32)
+
+        q_cpu, absmax_cpu = torch.ops.bitsandbytes.quantize_blockwise(A, code, blocksize)
+        # This dispatches through the native Metal kernel (routing is automatic on mps).
+        q_mps, absmax_mps = torch.ops.bitsandbytes.quantize_blockwise(A.to("mps"), code.to("mps"), blocksize)
+
+        # The kernel mirrors the reference math exactly (fp32 reductions, correctly-rounded
+        # division via -fno-fast-math), so codes AND absmax must be bit-exact.
+        assert_bit_exact(q_mps, q_cpu)
+        assert torch.equal(absmax_mps.cpu(), absmax_cpu)
+
+    @pytest.mark.parametrize("blocksize", [64, 256])
+    def test_native_partial_block_bit_exact(self, blocksize):
+        """Tail block (numel not divisible by blocksize) is also bit-exact."""
+        if not _NATIVE_AVAILABLE:
+            if _REQUIRE_NATIVE:
+                pytest.fail("BNB_MPS_REQUIRE_NATIVE=1 but native path unavailable.")
+            pytest.skip("Native MPS library not built.")
+
+        torch.manual_seed(1337)
+        A = torch.randn(7, blocksize - 1, dtype=torch.float32)
+        code = F.create_dynamic_map().to(torch.float32)
+
+        q_cpu, absmax_cpu = torch.ops.bitsandbytes.quantize_blockwise(A, code, blocksize)
+        q_mps, absmax_mps = torch.ops.bitsandbytes.quantize_blockwise(A.to("mps"), code.to("mps"), blocksize)
+
+        assert_bit_exact(q_mps, q_cpu)
+        assert torch.equal(absmax_mps.cpu(), absmax_cpu)
+
+    def test_graceful_fallback_when_native_absent(self, monkeypatch):
+        """With the native lib forced off, quantize_blockwise must still work (pure-torch)."""
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        monkeypatch.setattr(_mps_ops, "_mps_native", None, raising=False)
+        assert _mps_ops._native_available() is False
+
+        torch.manual_seed(1337)
+        A = torch.randn(256, 256, dtype=torch.float32)
+        code = F.create_dynamic_map().to(torch.float32)
+
+        q_cpu, absmax_cpu = torch.ops.bitsandbytes.quantize_blockwise(A, code, 128)
+        q_mps, absmax_mps = torch.ops.bitsandbytes.quantize_blockwise(A.to("mps"), code.to("mps"), 128)
+
+        # Pure-torch fallback is also bit-exact (proven in Phase 1).
+        assert_bit_exact(q_mps, q_cpu)
+        assert_parity(absmax_mps, absmax_cpu, torch.float32)
 
 
 class Test4bitParity:
@@ -273,7 +366,9 @@ class TestMatmul4bitParity:
                 absmax_offset=qs_mps.offset,
             )
         else:
-            out_cpu = torch.ops.bitsandbytes.gemm_4bit(A, B_q, list(B.shape), qs.absmax, blocksize, quant_type, bias=bias)
+            out_cpu = torch.ops.bitsandbytes.gemm_4bit(
+                A, B_q, list(B.shape), qs.absmax, blocksize, quant_type, bias=bias
+            )
             out_mps = torch.ops.bitsandbytes.gemm_4bit(
                 A.to("mps"),
                 B_q_mps,

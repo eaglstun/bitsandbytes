@@ -124,6 +124,63 @@ class XpuBNBNativeLibrary(BNBNativeLibrary):
             lib.cget_managed_ptr.restype = ct.c_void_p
 
 
+class MpsBNBNativeLibrary(BNBNativeLibrary):
+    """Apple Silicon MPS native library: hand-written Metal kernels + companion metallib.
+
+    Loaded independently of the main `lib` (which, on macOS without CUDA/ROCm/XPU, is the
+    CPU error-handler mock). Callers must pass torch MPS ``tensor.data_ptr()`` values --
+    on torch MPS a tensor's data pointer IS its ``id<MTLBuffer>`` -- for offset-0
+    contiguous tensors.
+    """
+
+    def __init__(self, lib: ct.CDLL, metallib_path: Path):
+        super().__init__(lib)
+        self.metallib_path = metallib_path
+        lib.bnb_mps_quantize_blockwise.restype = None
+        lib.bnb_mps_quantize_blockwise.argtypes = [
+            ct.c_void_p,  # code (float32[256])
+            ct.c_void_p,  # A (float32[n])
+            ct.c_void_p,  # out (uint8[n])
+            ct.c_void_p,  # absmax (float32[blocks])
+            ct.c_int64,  # n
+            ct.c_int64,  # blocksize
+        ]
+
+
+@functools.cache
+def get_mps_library() -> Optional[MpsBNBNativeLibrary]:
+    """Load the native MPS library if it (and its metallib) were built and are present.
+
+    Returns None -- never raises -- when MPS is unavailable or the native library / metallib
+    is missing (source installs without a `-DCOMPUTE_BACKEND=mps` build, wheels without it).
+    The MPS backend keeps its Hub/pure-torch fallback in that case.
+    """
+    if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        return None
+
+    lib_path = PACKAGE_DIR / f"libbitsandbytes_mps{DYNAMIC_LIBRARY_SUFFIX}"
+    metallib_path = PACKAGE_DIR / "bitsandbytes.metallib"
+
+    if not lib_path.exists() or not metallib_path.exists():
+        logger.debug(
+            "Native MPS library not found (lib=%s exists=%s, metallib exists=%s); using Hub/pure-torch fallback.",
+            lib_path,
+            lib_path.exists(),
+            metallib_path.exists(),
+        )
+        return None
+
+    try:
+        dll = ct.cdll.LoadLibrary(str(lib_path))
+        if not hasattr(dll, "bnb_mps_quantize_blockwise"):
+            logger.debug("Native MPS library at %s missing expected symbols; using fallback.", lib_path)
+            return None
+        return MpsBNBNativeLibrary(dll, metallib_path)
+    except Exception as e:
+        logger.debug("Failed to load native MPS library from %s: %s; using fallback.", lib_path, e)
+        return None
+
+
 def _split_cuda_version(compact: str, is_hip: bool) -> tuple[int, int]:
     """Split a compact CUDA/ROCm version string from a library filename into (major, minor).
 

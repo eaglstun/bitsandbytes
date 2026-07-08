@@ -1,117 +1,62 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#define HLF_MAX 65504
-#define TH 1024
-#define NUM 4
-#define NUM_BLOCK 4096
+// Blockwise 8-bit quantization, hand-written to match the CPU/default reference in
+// bitsandbytes/backends/default/ops.py::quantize_blockwise bit-for-bit:
+//
+//   absmax[b] = max(|A[i]|) over the block
+//   scaled    = clamp(A[i] * (1 / max(absmax[b], 1e-38)), -1, 1)
+//   out[i]    = searchsorted_left(scaled, bounds), bounds[j] = (code[j] + code[j+1]) / 2
+//
+// `code` is the 256-entry, sorted quantization map (same assumption as the CUDA kernel).
+// `searchsorted_left` reproduces torch.bucketize(..., right=False): the number of midpoint
+// bounds strictly less than `scaled`, yielding an index in [0, 255].
+//
+// One thread per block. This is the correctness-first shape (no SIMD-group reduction yet);
+// a per-block parallel absmax reduction is a later perf phase. The metallib is compiled
+// with -fno-fast-math (see CMakeLists.txt) so division is correctly rounded and no FMA
+// contraction occurs, which is what keeps the bucket selection identical to the CPU oracle.
 
-template<bool STOCHASTIC>
-static unsigned char quantize_scalar(
-  float rand,
-  device float* code,
-  float x)
-{
-    int pivot = 127;
-    int upper_pivot = 255;
-    int lower_pivot = 0;
+kernel void quantize_blockwise(
+    device const float* code [[buffer(0)]],
+    device const float* A [[buffer(1)]],
+    device uchar* out [[buffer(2)]],
+    device float* absmax [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant uint& blocksize [[buffer(5)]],
+    uint block_id [[thread_position_in_grid]]
+) {
+    const uint start = block_id * blocksize;
+    if (start >= n) {
+        return;
+    }
+    const uint end = min(start + blocksize, n);
 
-    float lower = -1.0f;
-    float upper = 1.0f;
+    // Per-block absmax (serial reduction over this block's elements).
+    float amax = 0.0f;
+    for (uint i = start; i < end; ++i) {
+        amax = fmax(amax, fabs(A[i]));
+    }
+    absmax[block_id] = amax;
 
-    float val = code[pivot];
-    // i>>=1 = {32, 16, 8, 4, 2, 1}
-    for(int i = 64; i > 0; i>>=1)
-    {
-        if(x > val)
-        {
-            lower_pivot = pivot;
-            lower = val;
-            pivot+=i;
+    // Match the reference's reciprocal-then-multiply (not a direct divide).
+    const float inv = 1.0f / fmax(amax, 1e-38f);
+
+    for (uint i = start; i < end; ++i) {
+        const float scaled = clamp(A[i] * inv, -1.0f, 1.0f);
+
+        // searchsorted-left over the 255 midpoint bounds of the 256-entry code table.
+        uint lo = 0;
+        uint hi = 255;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            const float bound = (code[mid] + code[mid + 1]) * 0.5f;
+            if (bound < scaled) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-        else
-        {
-            upper_pivot = pivot;
-            upper = val;
-            pivot-=i;
-        }
-        val = code[pivot];
+        out[i] = (uchar)lo;
     }
-
-    if(upper_pivot == 255)
-        upper = code[upper_pivot];
-    if(lower_pivot == 0)
-        lower = code[lower_pivot];
-
-    if(!STOCHASTIC)
-    {
-      if(x > val)
-      {
-        float midpoint = (upper+val)*0.5f;
-        if(x > midpoint)
-        {
-          return upper_pivot;
-        }
-        else
-          return pivot;
-      }
-      else
-      {
-        float midpoint = (lower+val)*0.5f;
-        if(x < midpoint)
-          return lower_pivot;
-        else
-          return pivot;
-      }
-    }
-    else
-    {
-      if(x > val)
-      {
-        float dist_to_upper = fabs(upper-x);
-        float dist_full = upper-val;
-        if(rand >= dist_to_upper/dist_full) return upper_pivot;
-        else return pivot;
-      }
-      else
-      {
-        float dist_to_lower = fabs(lower-x);
-        float dist_full = val-lower;
-        if(rand >= dist_to_lower/dist_full) return lower_pivot;
-        else return pivot;
-      }
-    }
-}
-
-kernel void quantize(device float* code [[buffer(0)]],
-                      device float* A [[buffer(1)]],
-                      device uchar* out [[buffer(2)]],
-                      constant uint& n [[buffer(3)]],
-                      uint id [[thread_position_in_grid]]) {
-  const uint n_full = (NUM_BLOCK * (n / NUM_BLOCK)) + (n % NUM_BLOCK == 0 ? 0 : NUM_BLOCK);
-  uint valid_items = (id / NUM_BLOCK + 1 == (n + NUM_BLOCK - 1) / NUM_BLOCK) ? n - (id / NUM_BLOCK * NUM_BLOCK) : NUM_BLOCK;
-  const uint base_idx = (id / NUM_BLOCK * NUM_BLOCK);
-
-  float vals[NUM];
-  uchar qvals[NUM];
-
-  for (uint i = base_idx; i < n_full; i += ((n + NUM_BLOCK - 1) / NUM_BLOCK) * NUM_BLOCK) {
-    valid_items = n - i > NUM_BLOCK ? NUM_BLOCK : n - i;
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint j = 0; j < valid_items; j++) {
-      vals[j] = A[i + j];
-    }
-
-    for (uint j = 0; j < valid_items; j++) {
-      qvals[j] = quantize_scalar<false>(0.0f, code, vals[j]);
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint j = 0; j < valid_items; j++) {
-      out[i + j] = qvals[j];
-    }
-  }
 }

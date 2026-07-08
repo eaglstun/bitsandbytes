@@ -1,14 +1,15 @@
-# MPS Backend Status — Phase 1 ground-truth audit
+# MPS Backend Status — Phase 1 audit + Phase 2 first native kernel
 
 **Date:** 2026-07-08 · **Branch:** `feature/mps-metal-kernels` (base: `777c145`)
 **Machine:** Apple Silicon (arm64), macOS **26.4.1**
-**Stack:** Python 3.14.2 · torch **2.12.1** · bitsandbytes 0.50.0.dev0 (source checkout, **no native build**)
-**Harness:** `tests/test_mps_parity.py` — baseline run: **183 passed, 1 xfailed (strict), 0 skipped** in ~7s.
+**Stack:** Python 3.14.2 · torch **2.12.1** · bitsandbytes 0.50.0.dev0
+**Harness:** `tests/test_mps_parity.py` — Phase-1 baseline (no native build): **183 passed, 1 xfailed
+(strict), 0 skipped**. Phase-2 source build (`-DCOMPUTE_BACKEND=mps`): **199 passed, 1 xfailed**, with
+`quantize_blockwise` running through hand-written Metal and bit-exact vs the CPU oracle.
 
-This is the Phase-1 deliverable from `PORT_PLAN.md` §3: an audit of what every
-`bitsandbytes::` op actually does on the `mps` device _today_, before any native Metal
-kernel is written. Re-verify against `bitsandbytes/_ops.py` and
-`bitsandbytes/backends/mps/ops.py` before trusting this after a rebase.
+This is the Phase-1 deliverable (§3 audit) plus the Phase-2 result (first native kernel end to end).
+Re-verify against `bitsandbytes/_ops.py` and `bitsandbytes/backends/mps/ops.py` before trusting this
+after a rebase. The Phase-2 native path is described in §7 below.
 
 ---
 
@@ -55,24 +56,24 @@ Three tiers, checked in order by the torch dispatcher:
 
 Parity = max deviation vs the CPU oracle with seeded inputs (see §3 for tolerances).
 
-| Op (`bitsandbytes::…`)            | `mps` reg?                     | Path that runs here             | Parity vs CPU oracle                               |
-| --------------------------------- | ------------------------------ | ------------------------------- | -------------------------------------------------- |
-| `quantize_blockwise`              | ✅ (binary-search impl)        | pure-torch on MPS               | codes **bit-exact**, absmax exact                  |
-| `dequantize_blockwise`            | ❌ → `default`                 | pure-torch on MPS               | exact (0.0) all dtypes/blocksizes                  |
-| `dequantize_blockwise.out`        | ❌ (cuda/xpu only, no default) | **`NotImplementedError`**       | — (gap)                                            |
-| `quantize_4bit`                   | ✅ (Hub → fallback)            | pure-torch fallback (Hub inert) | packed nibbles **bit-exact**, absmax exact         |
-| `dequantize_4bit` (+`.out`)       | ✅ (Hub → fallback)            | pure-torch fallback             | exact (0.0) all dtypes/blocksizes                  |
-| `gemv_4bit` (+`.out`)             | ✅ (Hub → dequant+`F.linear`)  | dequant + `F.linear` on MPS     | fp32 ≤ 7.7e-6; fp16/bf16 0.0 at tested sizes       |
-| `gemm_4bit`                       | ✅ (Hub M==1 → dequant+linear) | dequant + `F.linear` on MPS     | fp32 ≤ 3.9e-6; fp16/bf16 0.0 (incl. nested absmax) |
-| `int8_linear_matmul` (+`.out`)    | ❌ → `default`                 | fp32 matmul on MPS              | exact (int32)                                      |
-| `int8_vectorwise_quant`           | ❌ → `default`                 | pure-torch on MPS               | exact (incl. outlier extraction, threshold=6)      |
-| `int8_vectorwise_dequant`         | ❌ → `default`                 | pure-torch on MPS               | exact                                              |
-| `int8_mm_dequant`                 | ❌ → `default`                 | pure-torch on MPS               | exact                                              |
-| `int8_scaled_mm`                  | ❌ → `default`                 | composition of the above        | exact                                              |
-| `int8_mixed_scaled_mm`            | ❌ → `default`                 | composition of the above        | covered via components                             |
-| `int8_double_quant`               | ❌ (cuda only, no default)     | **`NotImplementedError`**       | — (gap; also unavailable on cpu)                   |
-| `optimizer_update_32bit`          | ❌ → `default`                 | pure-torch on MPS               | exact, **except lion + weight_decay (§5)**         |
-| `optimizer_update_8bit_blockwise` | ❌ (cpu/cuda/xpu, no default)  | **`NotImplementedError`**       | — (gap: 8-bit optimizers unusable on mps)          |
+| Op (`bitsandbytes::…`)            | `mps` reg?                     | Path that runs here                  | Parity vs CPU oracle                               |
+| --------------------------------- | ------------------------------ | ------------------------------------ | -------------------------------------------------- |
+| `quantize_blockwise`              | ✅ **native Metal** (P2)       | hand-written kernel (fallback avail) | codes **bit-exact**, absmax **bit-exact**          |
+| `dequantize_blockwise`            | ❌ → `default`                 | pure-torch on MPS                    | exact (0.0) all dtypes/blocksizes                  |
+| `dequantize_blockwise.out`        | ❌ (cuda/xpu only, no default) | **`NotImplementedError`**            | — (gap)                                            |
+| `quantize_4bit`                   | ✅ (Hub → fallback)            | pure-torch fallback (Hub inert)      | packed nibbles **bit-exact**, absmax exact         |
+| `dequantize_4bit` (+`.out`)       | ✅ (Hub → fallback)            | pure-torch fallback                  | exact (0.0) all dtypes/blocksizes                  |
+| `gemv_4bit` (+`.out`)             | ✅ (Hub → dequant+`F.linear`)  | dequant + `F.linear` on MPS          | fp32 ≤ 7.7e-6; fp16/bf16 0.0 at tested sizes       |
+| `gemm_4bit`                       | ✅ (Hub M==1 → dequant+linear) | dequant + `F.linear` on MPS          | fp32 ≤ 3.9e-6; fp16/bf16 0.0 (incl. nested absmax) |
+| `int8_linear_matmul` (+`.out`)    | ❌ → `default`                 | fp32 matmul on MPS                   | exact (int32)                                      |
+| `int8_vectorwise_quant`           | ❌ → `default`                 | pure-torch on MPS                    | exact (incl. outlier extraction, threshold=6)      |
+| `int8_vectorwise_dequant`         | ❌ → `default`                 | pure-torch on MPS                    | exact                                              |
+| `int8_mm_dequant`                 | ❌ → `default`                 | pure-torch on MPS                    | exact                                              |
+| `int8_scaled_mm`                  | ❌ → `default`                 | composition of the above             | exact                                              |
+| `int8_mixed_scaled_mm`            | ❌ → `default`                 | composition of the above             | covered via components                             |
+| `int8_double_quant`               | ❌ (cuda only, no default)     | **`NotImplementedError`**            | — (gap; also unavailable on cpu)                   |
+| `optimizer_update_32bit`          | ❌ → `default`                 | pure-torch on MPS                    | exact, **except lion + weight_decay (§5)**         |
+| `optimizer_update_8bit_blockwise` | ❌ (cpu/cuda/xpu, no default)  | **`NotImplementedError`**            | — (gap: 8-bit optimizers unusable on mps)          |
 
 **Round-trip reconstruction** (quantize→dequantize on MPS vs same on CPU, seeded randn,
 blocksize ∈ {64, 128, 256, 512}, dtypes fp32/fp16/bf16):
@@ -90,7 +91,7 @@ No "confident garbage" was observed anywhere in the current fallback stack.
 ## 3. Tolerances (documented, empirically calibrated)
 
 Used by `tests/test_mps_parity.py::assert_parity`; per-dtype (rtol, atol), CT2-style
-(fp32 tight, halfs looser). Measured headroom on this baseline is large — fp32 matmul
+(fp32 tight, halves looser). Measured headroom on this baseline is large — fp32 matmul
 divergence is accumulation-order only (≤ ~8e-6 at K ≤ 256); the looser fp16/bf16 bounds
 are chosen so the same harness keeps working when native Metal kernels (fast-math,
 different accumulation order) replace the fallbacks in Phase 2+.
@@ -179,7 +180,79 @@ loud-failure tests pinning the §5 gaps (if a gap op starts working, its test fa
 forcing this document to be updated).
 
 **Baseline record (2026-07-08, torch 2.12.1, macOS 26.4.1): 183 passed, 1 xfailed
-(strict; the lion divergence), 0 skipped, ~7 s.**
+(strict; the lion divergence), 0 skipped, ~7 s** (no native build).
 
-Phase-2 exit expectation: the same suite stays green with the native Metal path active,
-plus a marker/env asserting the native path (not a fallback) was hit.
+`TestNativeMetalPath` gates the Phase-2 native path: it skips when the native library is
+absent, or -- with `BNB_MPS_REQUIRE_NATIVE=1` -- fails hard, so a source-build verification
+run cannot silently pass on the fallback. It also proves graceful degradation
+(`test_graceful_fallback_when_native_absent` forces the native handle off and confirms the
+pure-torch path still works).
+
+---
+
+## 7. Phase 2 — first native kernel end to end (`quantize_blockwise`)
+
+**Status: complete and green.** On a source build (`cmake -DCOMPUTE_BACKEND=mps -S . -B . &&
+cmake --build . --config Release`), `bitsandbytes::quantize_blockwise` on `mps` runs through a
+hand-written Metal kernel and is **bit-exact** vs the CPU oracle (codes AND absmax) across
+fp32/fp16/bf16 × blocksize {64,128,256,512}, including partial-block tails. Full suite on the
+native build: **199 passed, 1 xfailed**.
+
+### Validation of the pre-existing kernel (plan §7 / step 1)
+
+The old `csrc/mps_kernels.metal::quantize` kernel was validated before trusting it. Its scalar
+binary-search core (`quantize_scalar<false>`) is **mathematically correct** — reimplemented in
+Python and checked against `torch.bucketize` over the dynamic map: 0/200 000 mismatches. **But the
+kernel as a whole was the wrong shape for the op**: no per-block absmax, no scaling by absmax, it
+never writes `absmax`, and it used an unrelated `NUM_BLOCK=4096` grid-stride loop instead of the
+op's `blocksize`. It predates the current op registry. → **Replaced**, not reused.
+
+### The three connected pieces
+
+1. **MSL kernel** (`csrc/mps_kernels.metal`, `quantize_blockwise`): one thread per block — per-block
+   absmax (serial reduction), `scaled = clamp(A * 1/max(absmax,1e-38), -1, 1)`, then a
+   searchsorted-left over the 255 midpoint bounds of the 256-entry code table (reproduces
+   `torch.bucketize(..., right=False)`). One-thread-per-block is the correctness-first shape; a
+   SIMD-group parallel absmax reduction is deferred to a perf phase (per the plan's "correct before
+   fast" rule). Compiled with **`-fno-fast-math`** (CMake) so division is correctly rounded and no
+   FMA contraction occurs — this is what makes bucket selection identical to the CPU oracle.
+2. **Dispatch layer** (`csrc/mps_ops.mm`): replaced the `NSLog("Not implemented")` stub with a real
+   encode path — cached device/queue/library/pipeline singletons, `commandBuffer` →
+   `computeCommandEncoder` → bind buffers → `dispatchThreads` → `commit` → `waitUntilCompleted`.
+   Stable `extern "C" bnb_mps_quantize_blockwise(code, A, out, absmax, n, blocksize)`.
+3. **Python load path** (`cextension.py` `MpsBNBNativeLibrary` + `get_mps_library()`;
+   `backends/mps/ops.py` routing): native when the lib + metallib are present, else today's
+   pure-torch fallback. Never hard-crashes when absent.
+
+### Key implementation decisions / surprises
+
+- **Buffer bridging with zero libtorch linkage.** The CMake `mps` target links only Metal/MPS
+  frameworks, not libtorch — so the classic ATen `getMTLBufferStorage` include path isn't available.
+  Empirically confirmed on this machine that **a torch MPS tensor's `data_ptr()` IS its
+  `id<MTLBuffer>`** (probed: cast to `id<MTLBuffer>`, `[buffer length]` == tensor byte size, class
+  `AGXG16XFamilyBuffer`). So the `.mm` casts the ctypes-passed `void*` straight to `id<MTLBuffer>`.
+  Ruled out along the way: `data_ptr()` is **not** page-aligned (offsets 4032/6272/…), so
+  `newBufferWithBytesNoCopy` fails; and it is **not** a CPU-readable unified pointer (reads returned
+  garbage), so a memcpy-in/out bridge is impossible. The object-pointer bridge is the only one that
+  works from a ctypes lib.
+- **Offset-0 requirement.** `data_ptr()` equals the buffer object only for a `storage_offset == 0`
+  tensor; a view's `data_ptr()` is `buffer + offset` and would cast wrong. The Python wrapper forces
+  fresh, contiguous, offset-0 fp32 buffers (`_ensure_native_buffer`) before the call. Cost: a copy of
+  A per call (acceptable, correctness-first; a later phase can avoid it).
+- **Cross-queue synchronization.** The kernel dispatches on its own `MTLCommandQueue`, not torch's
+  MPS stream. `torch.mps.synchronize()` is called **before** the dispatch (torch's writes to A/code
+  materialized) and the `.mm` blocks on `waitUntilCompleted` **after** commit (outputs complete
+  before torch reads). This is the "flush first" lesson from the op-graduation playbook, adapted to a
+  separate queue.
+- **Install-safe metallib load (plan §4).** The old `get_library()` loaded `bitsandbytes.metallib`
+  by CWD-relative path. Now resolved via `dladdr` on a symbol in this dylib → same directory as the
+  loaded `.dylib` (both land in `PACKAGE_DIR`), with a `BNB_MPS_METALLIB` env override and a
+  CWD-relative last resort.
+- **Build layout.** The metallib custom command writes relative paths, so the build must be
+  **in-source** (`-B .`, matching the plan's `cmake -S .` recipe) for the metallib and dylib to land
+  together in `bitsandbytes/`. An out-of-tree `-B build/` split them. Both files are gitignored.
+  **Packaging risk still open (§4):** neither `MANIFEST.in` nor `pyproject.toml` yet force-includes
+  the `.metallib`/`_mps.dylib` into a wheel — fine for an editable source build (what Phase 2
+  targets), must be addressed before shipping a wheel.
+
+Phases 3+ (dequantize_blockwise, the 4-bit ops, then the 4-bit matmuls) reuse this exact pipe.
