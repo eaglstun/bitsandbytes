@@ -252,9 +252,8 @@ op's `blocksize`. It predates the current op registry. → **Replaced**, not reu
 - **Build layout.** The metallib custom command writes relative paths, so the build must be
   **in-source** (`-B .`, matching the plan's `cmake -S .` recipe) for the metallib and dylib to land
   together in `bitsandbytes/`. An out-of-tree `-B build/` split them. Both files are gitignored.
-  **Packaging risk still open (§4):** neither `MANIFEST.in` nor `pyproject.toml` yet force-includes
-  the `.metallib`/`_mps.dylib` into a wheel — fine for an editable source build (what Phase 2
-  targets), must be addressed before shipping a wheel.
+  **Packaging risk RESOLVED (§9):** the wheel now ships both the `.metallib` and `_mps.dylib` (see
+  §9).
 
 Phase 3 (below) graduated dequantize_blockwise + the 4-bit ops onto this exact pipe; the 4-bit
 matmuls (`gemv_4bit`/`gemm_4bit`) remain the separate, later hard sub-phase.
@@ -308,6 +307,63 @@ the native path and logs a clear, actionable error** (falls back to pure-torch �
 corruption); `BNB_MPS_REQUIRE_NATIVE=1` then turns that into a hard test failure. Verified: real tensor
 → 1, null pointer → 0, oversize length → 0 (`test_buffer_contract_guard`).
 
-**Unchanged debt (not regressed):** the per-call offset-0 copy of inputs, and the wheel-packaging gap
-(metallib/dylib not yet force-included in a wheel). `gemv_4bit`/`gemm_4bit` fused matmul and the
-int8/optimizer ops remain out of scope.
+**Unchanged debt (not regressed):** the per-call offset-0 copy of inputs. `gemv_4bit`/`gemm_4bit`
+fused matmul and the int8/optimizer ops remain out of scope. (The wheel-packaging gap is now closed
+— see §9.)
+
+---
+
+## 9. Packaging — native MPS from a `pip install` (not only source builds)
+
+**Status: resolved.** The wheel now ships both native artifacts and native MPS loads from a plain
+`pip install`.
+
+**The gap.** `pyproject.toml` `[tool.setuptools] package-data` matched `libbitsandbytes*.*` — that glob
+catches every shared library (all prefixed `lib…`, including `libbitsandbytes_mps.dylib`) but **misses
+`bitsandbytes.metallib`**, which has no `lib` prefix. A wheel built before this fix carried the dylib
+but not the shader archive, so `get_mps_library()` found the dylib, failed the `metallib.exists()`
+gate, and silently fell back to pure-torch.
+
+**The fix (packaging only, one line).** Added a `*.metallib` entry to `package-data`:
+
+```toml
+package-data = { "*" = ["libbitsandbytes*.*", "*.metallib", "py.typed"] }
+```
+
+Verified the `.dylib` is genuinely covered by the existing glob (not assumed) — see the `unzip -l`
+evidence below; both land at `bitsandbytes/…`.
+
+**Build flow (matches how bnb ships prebuilt CUDA `.so`s).** `setup.py`'s `ExtBuildPy` runs a CMake
+build (default `COMPUTE_BACKEND=cpu`) during `build_py` **unless `BNB_SKIP_CMAKE=1`**. (`wheel.cmake =
+false` is a scikit-build-core _native_-backend setting; this repo uses the `scikit_build_core.setuptools`
+shim, where the CMake step is driven by `setup.py` + the `BNB_SKIP_CMAKE` env, so `BNB_SKIP_CMAKE=1` is
+the actual switch that skips it.) So the flow is:
+
+```bash
+cmake -DCOMPUTE_BACKEND=mps -S . -B . && cmake --build . --config Release   # artifacts -> bitsandbytes/
+rm -rf build/ dist/                                                          # avoid staging a stale cpu dylib
+BNB_SKIP_CMAKE=1 python -m build --wheel                                     # package pre-built artifacts, no re-run
+```
+
+Gotcha found: without `BNB_SKIP_CMAKE=1`, `python -m build` re-runs CMake as `cpu` and adds a stray
+`libbitsandbytes_cpu.dylib`; and a stale `build/lib…/` staging dir from an earlier non-skip build gets
+swept into the wheel, so clean `build/` first.
+
+**Inclusion proof — `unzip -l dist/*.whl`:**
+
+```
+    18074  bitsandbytes/bitsandbytes.metallib
+    75928  bitsandbytes/libbitsandbytes_mps.dylib
+```
+
+**Runtime proof — isolated throwaway venv (not the source tree).** Fresh venv, `pip install --no-deps`
+the built wheel (torch inherited), run from outside the worktree so `import bitsandbytes` resolves to
+the _installed_ package. Confirmed against the installed wheel:
+`bitsandbytes.__file__` → venv site-packages; both artifacts present in the installed package;
+`get_mps_library()` loads native with `metallib_path` resolved (via `dladdr`) inside the venv;
+`verify_buffer_contract()` passes; native `quantize_blockwise` bit-exact vs CPU; and the parity subset
+`-k "Native or Blockwise8bit or Test4bitParity"` runs **236 passed** with `BNB_MPS_REQUIRE_NATIVE=1`.
+
+**Still open (not this task):** the wheel is a plain-tagged platform wheel; CI matrix / release
+automation to actually publish MPS wheels is a separate concern. The per-call offset-0 input copy and
+the fused 4-bit matmuls remain as documented above.

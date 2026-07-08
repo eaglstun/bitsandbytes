@@ -73,7 +73,11 @@ test = [
 ]
 
 [tool.setuptools]
-package-data = { "*" = ["libbitsandbytes*.*", "py.typed"] }
+# NOTE: the "libbitsandbytes*.*" glob covers the CUDA/ROCm/XPU/CPU/MPS shared libraries
+# (all prefixed "lib..."), but NOT the Apple Silicon Metal shader archive, which is named
+# "bitsandbytes.metallib" (no "lib" prefix) -- it needs its own "*.metallib" entry so the
+# native MPS backend works from a wheel install, not only a source build.
+package-data = { "*" = ["libbitsandbytes*.*", "*.metallib", "py.typed"] }
 
 [tool.setuptools.packages.find]
 include = ["bitsandbytes*"]
