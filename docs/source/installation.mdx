@@ -20,6 +20,8 @@ We provide official support for NVIDIA GPUs, CPUs, Intel XPUs, and Intel Gaudi. 
 - [AMD ROCm (Preview)](#rocm)
   - [Installation via PyPI](#rocm-pip)
   - [Compile from Source](#rocm-compile)
+- [Apple Silicon / Metal (Preview)](#apple-silicon)
+  - [Compile from Source](#apple-silicon-compile)
 - [Preview Wheels](#preview-wheels)
 
 ## System Requirements[[requirements]]
@@ -308,6 +310,45 @@ pip install .
 ```
 </hfoption>
 </hfoptions>
+
+## Apple Silicon / Metal (Preview)[[apple-silicon]]
+
+* Support for Apple Silicon GPUs (the PyTorch `mps` backend) is currently in a preview state.
+* The native backend provides hand-written Metal kernels for **4-bit (NF4/FP4) and 8-bit blockwise quantization and dequantization**, each verified bit-exact against the CPU reference.
+* **4-bit (QLoRA-style) inference works end to end**, but the 4-bit matmul is **not yet fused**: the quantized weights are dequantized through a Metal kernel and the matmul then runs via `torch.nn.functional.linear`. This is correct but not yet performance-optimized.
+* **Not supported on `mps`:** LLM.int8() and the 8-bit optimizers. These raise `NotImplementedError` (or fall through to slow generic paths) and are not part of the current backend.
+* When the native library is not present, the `mps` backend transparently falls back to a pure-PyTorch implementation, so nothing hard-crashes on an unbuilt install.
+
+### Requirements
+
+* macOS 14 (Sonoma) or newer.
+* An Apple Silicon Mac (M1 or newer).
+* A recent PyTorch build with MPS support (PyTorch >= 2.4). Verify with:
+
+```py
+import torch
+print(torch.backends.mps.is_available())  # should print True
+```
+
+### Compile from Source[[apple-silicon-compile]]
+
+Native MPS support is included in the built wheel, so a standard `pip install bitsandbytes` will use the Metal kernels when they are packaged for your platform. To build from source (for development, or a platform without a prebuilt wheel), you need CMake >= **3.31.6**, Python >= **3.10**, and the Xcode command line tools (which provide `xcrun metal` / `xcrun metallib` and an Objective-C++ compiler).
+
+```bash
+# Clone bitsandbytes repo
+git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git && cd bitsandbytes/
+
+# Configure and build the Metal backend (produces libbitsandbytes_mps.dylib
+# and bitsandbytes.metallib inside the bitsandbytes/ package directory)
+cmake -DCOMPUTE_BACKEND=mps -S .
+cmake --build . --config Release
+
+# Install
+pip install -e .   # `-e` for "editable" install, when developing BNB (otherwise leave that out)
+```
+
+> [!TIP]
+> Configure in-source (`cmake -S .`, i.e. with the build directory at the repository root) so the compiled `bitsandbytes.metallib` lands next to `libbitsandbytes_mps.dylib` inside the `bitsandbytes/` package directory, where the loader expects it.
 
 ## Preview Wheels[[preview-wheels]]
 
