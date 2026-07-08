@@ -105,45 +105,151 @@ static id<MTLComputePipelineState> get_pipeline(NSString* name) {
     return pso;
 }
 
+// Load-time guard for the data_ptr()-is-the-MTLBuffer contract (an undocumented torch
+// internal). Given a pointer that Python obtained from a real MPS tensor's data_ptr() plus
+// that tensor's byte size, verify it resolves to a genuine id<MTLBuffer> of at least that
+// size. Returns 1 on success, 0 if the contract does not hold -- so a future torch that
+// changes the meaning of data_ptr() surfaces as a clear, actionable failure (native path
+// disabled + logged) instead of a blind cast of garbage. Cheap: called once at load.
+extern "C" int bnb_mps_check_buffer_contract(void* ptr, int64_t min_bytes) {
+    @autoreleasepool {
+        if (!ptr) {
+            return 0;
+        }
+        @try {
+            id obj = (__bridge id)ptr;
+            if (![obj conformsToProtocol:@protocol(MTLBuffer)]) {
+                return 0;
+            }
+            id<MTLBuffer> buf = (id<MTLBuffer>)obj;
+            if ((int64_t)[buf length] < min_bytes) {
+                return 0;
+            }
+            return 1;
+        } @catch (...) {
+            return 0;
+        }
+    }
+}
+
+// One thread per block: cap the threadgroup and dispatch a non-uniform grid, then block on
+// completion. dispatchThreads is supported on all Apple Silicon GPUs.
+static void dispatch_per_block(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso, int64_t num_blocks) {
+    NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
+    if (tg > 256) {
+        tg = 256;
+    }
+    if (tg > (NSUInteger)num_blocks) {
+        tg = (NSUInteger)num_blocks;
+    }
+    if (tg == 0) {
+        tg = 1;
+    }
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+}
+
 // quantize_blockwise: code (float32[256]), A (float32[n]) -> out (uint8[n]), absmax
 // (float32[ceil(n/blocksize)]). All pointers are torch MPS tensor data_ptr() values,
 // i.e. id<MTLBuffer> objects for offset-0 contiguous tensors.
 extern "C" void bnb_mps_quantize_blockwise(void* code, void* A, void* out, void* absmax, int64_t n, int64_t blocksize) {
     @autoreleasepool {
-        id<MTLBuffer> codeBuf = (__bridge id<MTLBuffer>)code;
-        id<MTLBuffer> aBuf = (__bridge id<MTLBuffer>)A;
-        id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)out;
-        id<MTLBuffer> absmaxBuf = (__bridge id<MTLBuffer>)absmax;
-
         id<MTLComputePipelineState> pso = get_pipeline(@"quantize_blockwise");
         id<MTLCommandBuffer> cb = [get_queue() commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:pso];
 
-        [enc setBuffer:codeBuf offset:0 atIndex:0];
-        [enc setBuffer:aBuf offset:0 atIndex:1];
-        [enc setBuffer:outBuf offset:0 atIndex:2];
-        [enc setBuffer:absmaxBuf offset:0 atIndex:3];
+        [enc setBuffer:(__bridge id<MTLBuffer>)code offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)A offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)absmax offset:0 atIndex:3];
 
         uint32_t n32 = (uint32_t)n;
         uint32_t bs32 = (uint32_t)blocksize;
         [enc setBytes:&n32 length:sizeof(n32) atIndex:4];
         [enc setBytes:&bs32 length:sizeof(bs32) atIndex:5];
 
-        const NSUInteger num_blocks = (NSUInteger)((n + blocksize - 1) / blocksize);
-        NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
-        if (tg > 256) {
-            tg = 256;
-        }
-        if (tg > num_blocks) {
-            tg = num_blocks;
-        }
-        if (tg == 0) {
-            tg = 1;
-        }
+        dispatch_per_block(enc, pso, (n + blocksize - 1) / blocksize);
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+}
 
-        // One thread per block; non-uniform threadgroups (Apple GPUs support dispatchThreads).
-        [enc dispatchThreads:MTLSizeMake(num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+// dequantize_blockwise: code (float32[256]), A (uint8[n]), absmax (float32[blocks]) ->
+// out (float32[n]). Python casts fp32 out to the requested dtype.
+extern "C" void
+    bnb_mps_dequantize_blockwise(void* code, void* A, void* absmax, void* out, int64_t n, int64_t blocksize) {
+    @autoreleasepool {
+        id<MTLComputePipelineState> pso = get_pipeline(@"dequantize_blockwise");
+        id<MTLCommandBuffer> cb = [get_queue() commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+
+        [enc setBuffer:(__bridge id<MTLBuffer>)code offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)A offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)absmax offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:3];
+
+        uint32_t n32 = (uint32_t)n;
+        uint32_t bs32 = (uint32_t)blocksize;
+        [enc setBytes:&n32 length:sizeof(n32) atIndex:4];
+        [enc setBytes:&bs32 length:sizeof(bs32) atIndex:5];
+
+        dispatch_per_block(enc, pso, (n + blocksize - 1) / blocksize);
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+}
+
+// dequantize_4bit: code (float32[16]), A (uint8 packed), absmax (float32[blocks]) ->
+// out (float32[n]). Python casts fp32 out to the requested dtype and reshapes.
+extern "C" void bnb_mps_dequantize_4bit(void* code, void* A, void* absmax, void* out, int64_t n, int64_t blocksize) {
+    @autoreleasepool {
+        id<MTLComputePipelineState> pso = get_pipeline(@"dequantize_4bit");
+        id<MTLCommandBuffer> cb = [get_queue() commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+
+        [enc setBuffer:(__bridge id<MTLBuffer>)code offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)A offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)absmax offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:3];
+
+        uint32_t n32 = (uint32_t)n;
+        uint32_t bs32 = (uint32_t)blocksize;
+        [enc setBytes:&n32 length:sizeof(n32) atIndex:4];
+        [enc setBytes:&bs32 length:sizeof(bs32) atIndex:5];
+
+        dispatch_per_block(enc, pso, (n + blocksize - 1) / blocksize);
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+}
+
+// quantize_4bit: bounds (float32[15]), order (uint8[16]), A (float32[n]) ->
+// out (uint8 packed, ceil(n/2)), absmax (float32[blocks]).
+extern "C" void
+    bnb_mps_quantize_4bit(void* bounds, void* order, void* A, void* out, void* absmax, int64_t n, int64_t blocksize) {
+    @autoreleasepool {
+        id<MTLComputePipelineState> pso = get_pipeline(@"quantize_4bit");
+        id<MTLCommandBuffer> cb = [get_queue() commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+
+        [enc setBuffer:(__bridge id<MTLBuffer>)bounds offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)order offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)A offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:3];
+        [enc setBuffer:(__bridge id<MTLBuffer>)absmax offset:0 atIndex:4];
+
+        uint32_t n32 = (uint32_t)n;
+        uint32_t bs32 = (uint32_t)blocksize;
+        [enc setBytes:&n32 length:sizeof(n32) atIndex:5];
+        [enc setBytes:&bs32 length:sizeof(bs32) atIndex:6];
+
+        dispatch_per_block(enc, pso, (n + blocksize - 1) / blocksize);
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];

@@ -136,6 +136,10 @@ class MpsBNBNativeLibrary(BNBNativeLibrary):
     def __init__(self, lib: ct.CDLL, metallib_path: Path):
         super().__init__(lib)
         self.metallib_path = metallib_path
+
+        lib.bnb_mps_check_buffer_contract.restype = ct.c_int
+        lib.bnb_mps_check_buffer_contract.argtypes = [ct.c_void_p, ct.c_int64]
+
         lib.bnb_mps_quantize_blockwise.restype = None
         lib.bnb_mps_quantize_blockwise.argtypes = [
             ct.c_void_p,  # code (float32[256])
@@ -145,6 +149,54 @@ class MpsBNBNativeLibrary(BNBNativeLibrary):
             ct.c_int64,  # n
             ct.c_int64,  # blocksize
         ]
+
+        lib.bnb_mps_dequantize_blockwise.restype = None
+        lib.bnb_mps_dequantize_blockwise.argtypes = [
+            ct.c_void_p,  # code (float32[256])
+            ct.c_void_p,  # A (uint8[n])
+            ct.c_void_p,  # absmax (float32[blocks])
+            ct.c_void_p,  # out (float32[n])
+            ct.c_int64,  # n
+            ct.c_int64,  # blocksize
+        ]
+
+        lib.bnb_mps_dequantize_4bit.restype = None
+        lib.bnb_mps_dequantize_4bit.argtypes = [
+            ct.c_void_p,  # code (float32[16])
+            ct.c_void_p,  # A (uint8 packed)
+            ct.c_void_p,  # absmax (float32[blocks])
+            ct.c_void_p,  # out (float32[n])
+            ct.c_int64,  # n
+            ct.c_int64,  # blocksize
+        ]
+
+        lib.bnb_mps_quantize_4bit.restype = None
+        lib.bnb_mps_quantize_4bit.argtypes = [
+            ct.c_void_p,  # bounds (float32[15])
+            ct.c_void_p,  # order (uint8[16])
+            ct.c_void_p,  # A (float32[n])
+            ct.c_void_p,  # out (uint8 packed)
+            ct.c_void_p,  # absmax (float32[blocks])
+            ct.c_int64,  # n
+            ct.c_int64,  # blocksize
+        ]
+
+    def verify_buffer_contract(self) -> None:
+        """Verify the undocumented torch contract that an MPS tensor's data_ptr() is its
+        id<MTLBuffer>. Raises RuntimeError if a future torch has broken it, so callers can
+        disable the native path loudly instead of casting garbage into a Metal kernel.
+        """
+        probe = torch.empty(1024, dtype=torch.float32, device="mps")
+        torch.mps.synchronize()
+        ok = self._lib.bnb_mps_check_buffer_contract(ct.c_void_p(probe.data_ptr()), ct.c_int64(probe.numel() * 4))
+        if ok != 1:
+            raise RuntimeError(
+                "bitsandbytes MPS native path DISABLED: a torch MPS tensor's data_ptr() no longer "
+                "resolves to its id<MTLBuffer> (this torch version broke the undocumented contract the "
+                "native Metal kernels rely on). Falling back to the pure-PyTorch path. "
+                f"torch={torch.__version__}. Please report this at "
+                "https://github.com/bitsandbytes-foundation/bitsandbytes/issues"
+            )
 
 
 @functools.cache
@@ -175,10 +227,20 @@ def get_mps_library() -> Optional[MpsBNBNativeLibrary]:
         if not hasattr(dll, "bnb_mps_quantize_blockwise"):
             logger.debug("Native MPS library at %s missing expected symbols; using fallback.", lib_path)
             return None
-        return MpsBNBNativeLibrary(dll, metallib_path)
+        native = MpsBNBNativeLibrary(dll, metallib_path)
     except Exception as e:
         logger.debug("Failed to load native MPS library from %s: %s; using fallback.", lib_path, e)
         return None
+
+    # Harden the data_ptr()-is-the-MTLBuffer bridge everything rides on: verify it once,
+    # loudly disable native (not crash, not corrupt) if a future torch breaks the contract.
+    try:
+        native.verify_buffer_contract()
+    except Exception as e:
+        logger.error("%s", e)
+        return None
+
+    return native
 
 
 def _split_cuda_version(compact: str, is_hip: bool) -> tuple[int, int]:

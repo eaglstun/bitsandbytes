@@ -4,8 +4,9 @@
 **Machine:** Apple Silicon (arm64), macOS **26.4.1**
 **Stack:** Python 3.14.2 · torch **2.12.1** · bitsandbytes 0.50.0.dev0
 **Harness:** `tests/test_mps_parity.py` — Phase-1 baseline (no native build): **183 passed, 1 xfailed
-(strict), 0 skipped**. Phase-2 source build (`-DCOMPUTE_BACKEND=mps`): **199 passed, 1 xfailed**, with
-`quantize_blockwise` running through hand-written Metal and bit-exact vs the CPU oracle.
+(strict), 0 skipped**. Phase-3 source build (`-DCOMPUTE_BACKEND=mps`, `BNB_MPS_REQUIRE_NATIVE=1`):
+**293 passed, 1 xfailed**, with `quantize_blockwise`, `dequantize_blockwise`, `dequantize_4bit`, and
+`quantize_4bit` all running through hand-written Metal and bit-exact vs the CPU oracle.
 
 This is the Phase-1 deliverable (§3 audit) plus the Phase-2 result (first native kernel end to end).
 Re-verify against `bitsandbytes/_ops.py` and `bitsandbytes/backends/mps/ops.py` before trusting this
@@ -56,24 +57,24 @@ Three tiers, checked in order by the torch dispatcher:
 
 Parity = max deviation vs the CPU oracle with seeded inputs (see §3 for tolerances).
 
-| Op (`bitsandbytes::…`)            | `mps` reg?                     | Path that runs here                  | Parity vs CPU oracle                               |
-| --------------------------------- | ------------------------------ | ------------------------------------ | -------------------------------------------------- |
-| `quantize_blockwise`              | ✅ **native Metal** (P2)       | hand-written kernel (fallback avail) | codes **bit-exact**, absmax **bit-exact**          |
-| `dequantize_blockwise`            | ❌ → `default`                 | pure-torch on MPS                    | exact (0.0) all dtypes/blocksizes                  |
-| `dequantize_blockwise.out`        | ❌ (cuda/xpu only, no default) | **`NotImplementedError`**            | — (gap)                                            |
-| `quantize_4bit`                   | ✅ (Hub → fallback)            | pure-torch fallback (Hub inert)      | packed nibbles **bit-exact**, absmax exact         |
-| `dequantize_4bit` (+`.out`)       | ✅ (Hub → fallback)            | pure-torch fallback                  | exact (0.0) all dtypes/blocksizes                  |
-| `gemv_4bit` (+`.out`)             | ✅ (Hub → dequant+`F.linear`)  | dequant + `F.linear` on MPS          | fp32 ≤ 7.7e-6; fp16/bf16 0.0 at tested sizes       |
-| `gemm_4bit`                       | ✅ (Hub M==1 → dequant+linear) | dequant + `F.linear` on MPS          | fp32 ≤ 3.9e-6; fp16/bf16 0.0 (incl. nested absmax) |
-| `int8_linear_matmul` (+`.out`)    | ❌ → `default`                 | fp32 matmul on MPS                   | exact (int32)                                      |
-| `int8_vectorwise_quant`           | ❌ → `default`                 | pure-torch on MPS                    | exact (incl. outlier extraction, threshold=6)      |
-| `int8_vectorwise_dequant`         | ❌ → `default`                 | pure-torch on MPS                    | exact                                              |
-| `int8_mm_dequant`                 | ❌ → `default`                 | pure-torch on MPS                    | exact                                              |
-| `int8_scaled_mm`                  | ❌ → `default`                 | composition of the above             | exact                                              |
-| `int8_mixed_scaled_mm`            | ❌ → `default`                 | composition of the above             | covered via components                             |
-| `int8_double_quant`               | ❌ (cuda only, no default)     | **`NotImplementedError`**            | — (gap; also unavailable on cpu)                   |
-| `optimizer_update_32bit`          | ❌ → `default`                 | pure-torch on MPS                    | exact, **except lion + weight_decay (§5)**         |
-| `optimizer_update_8bit_blockwise` | ❌ (cpu/cuda/xpu, no default)  | **`NotImplementedError`**            | — (gap: 8-bit optimizers unusable on mps)          |
+| Op (`bitsandbytes::…`)            | `mps` reg?                       | Path that runs here                  | Parity vs CPU oracle                               |
+| --------------------------------- | -------------------------------- | ------------------------------------ | -------------------------------------------------- |
+| `quantize_blockwise`              | ✅ **native Metal** (P2)         | hand-written kernel (fallback avail) | codes **bit-exact**, absmax **bit-exact**          |
+| `dequantize_blockwise`            | ✅ **native Metal** (P3)         | hand-written kernel (fallback avail) | **bit-exact** all dtypes/blocksizes                |
+| `dequantize_blockwise.out`        | ❌ (cuda/xpu only, no default)   | **`NotImplementedError`**            | — (gap)                                            |
+| `quantize_4bit`                   | ✅ **native Metal** (P3)         | hand-written kernel (fallback avail) | packed nibbles **bit-exact**, absmax **bit-exact** |
+| `dequantize_4bit` (+`.out`)       | ✅ **native Metal** (P3)         | hand-written kernel (fallback avail) | **bit-exact** all dtypes/blocksizes                |
+| `gemv_4bit` (+`.out`)             | ✅ (dequant native + `F.linear`) | native dequant + `F.linear` on MPS   | fp32 ≤ 7.7e-6; fp16/bf16 0.0 at tested sizes       |
+| `gemm_4bit`                       | ✅ (Hub M==1 → dequant+linear)   | dequant + `F.linear` on MPS          | fp32 ≤ 3.9e-6; fp16/bf16 0.0 (incl. nested absmax) |
+| `int8_linear_matmul` (+`.out`)    | ❌ → `default`                   | fp32 matmul on MPS                   | exact (int32)                                      |
+| `int8_vectorwise_quant`           | ❌ → `default`                   | pure-torch on MPS                    | exact (incl. outlier extraction, threshold=6)      |
+| `int8_vectorwise_dequant`         | ❌ → `default`                   | pure-torch on MPS                    | exact                                              |
+| `int8_mm_dequant`                 | ❌ → `default`                   | pure-torch on MPS                    | exact                                              |
+| `int8_scaled_mm`                  | ❌ → `default`                   | composition of the above             | exact                                              |
+| `int8_mixed_scaled_mm`            | ❌ → `default`                   | composition of the above             | covered via components                             |
+| `int8_double_quant`               | ❌ (cuda only, no default)       | **`NotImplementedError`**            | — (gap; also unavailable on cpu)                   |
+| `optimizer_update_32bit`          | ❌ → `default`                   | pure-torch on MPS                    | exact, **except lion + weight_decay (§5)**         |
+| `optimizer_update_8bit_blockwise` | ❌ (cpu/cuda/xpu, no default)    | **`NotImplementedError`**            | — (gap: 8-bit optimizers unusable on mps)          |
 
 **Round-trip reconstruction** (quantize→dequantize on MPS vs same on CPU, seeded randn,
 blocksize ∈ {64, 128, 256, 512}, dtypes fp32/fp16/bf16):
@@ -255,4 +256,58 @@ op's `blocksize`. It predates the current op registry. → **Replaced**, not reu
   the `.metallib`/`_mps.dylib` into a wheel — fine for an editable source build (what Phase 2
   targets), must be addressed before shipping a wheel.
 
-Phases 3+ (dequantize_blockwise, the 4-bit ops, then the 4-bit matmuls) reuse this exact pipe.
+Phase 3 (below) graduated dequantize_blockwise + the 4-bit ops onto this exact pipe; the 4-bit
+matmuls (`gemv_4bit`/`gemm_4bit`) remain the separate, later hard sub-phase.
+
+---
+
+## 8. Phase 3 — remaining quant/dequant ops on native Metal
+
+**Status: complete and green.** On the source build, three more ops run through hand-written Metal
+and are **bit-exact** vs the CPU oracle. Full suite on the native build: **293 passed, 1 xfailed**
+(with `BNB_MPS_REQUIRE_NATIVE=1`). Order graduated, each with a green parity test before the next:
+
+| Op                     | New registration?                        | Parity vs CPU oracle (native path)                                            |
+| ---------------------- | ---------------------------------------- | ----------------------------------------------------------------------------- |
+| `dequantize_blockwise` | **yes** (was missing on mps → `default`) | out **bit-exact** (`torch.equal`), fp32/fp16/bf16 × bs {64,128,256,512}       |
+| `dequantize_4bit`      | native swap                              | out **bit-exact**, NF4+FP4 × all dtypes/blocksizes incl. odd-numel tail       |
+| `quantize_4bit`        | native swap                              | packed nibbles + absmax **bit-exact**, incl. `quant_storage=bf16` reinterpret |
+
+- **Kernels** (`csrc/mps_kernels.metal`): `dequantize_blockwise` (`out[i]=code[A[i]]*absmax[i/bs]`),
+  `dequantize_4bit` (high nibble→even index, low→odd; `out[j]=code4[nib]*absmax[j/bs]`), and
+  `quantize_4bit` (per-block absmax + searchsorted over the 15 midpoint bounds of the sorted code +
+  `order` remap for FP4 + nibble pack). All one-thread-per-block, fp32 internally; the Python wrapper
+  casts dequant output to the requested dtype (matching the reference's trailing `.to(dtype)`), which
+  is what makes the fp16/bf16 dequant outputs land **bit-exact** rather than merely within tolerance.
+- **Tolerances:** integer/packed outputs (codes, packed nibbles, absmax) asserted **bit-exact**
+  (`torch.equal` / view-as-uint8 to dodge NaN≠NaN on the bf16 reinterpret); float dequant outputs use
+  the Phase-1 per-dtype tolerances (`assert_parity`) but measured bit-exact in practice.
+- **Two reference subtleties reproduced (both were latent bugs risks):**
+  1. **Tail-block asymmetry.** The reference stores the tail (partial) block's absmax **clamped** to
+     1e-38 and scales it by **direct divide** (`A/absmax`), while full blocks store the **raw** max and
+     use **reciprocal-multiply** (`A*(1/absmax)`). Under `-fno-fast-math` these differ by up to 1 ulp,
+     which can flip a bucket. The Phase-2 `quantize_blockwise` kernel used reciprocal-multiply for all
+     blocks and only passed because test tails were non-zero randn — **hardened in Phase 3** to branch
+     on `is_tail` for both `quantize_blockwise` and `quantize_4bit`.
+  2. **Odd-numel padding nibble.** For odd numel the reference pads `scaled` with `0.0` and
+     **quantizes that** (a nonzero NF4/FP4 index), then packs it as the final low nibble. The kernel
+     must quantize `0.0` for that slot, not write a literal `0` — caught by the partial-block test (it
+     was a real 1-code mismatch until fixed).
+- **`dequantize_4bit` also feeds the matmul fallbacks:** routing it native means `gemv_4bit`/`gemm_4bit`
+  on mps now dequantize through Metal before the pure-torch `F.linear`. Their parity tests stay green.
+  The matmul itself is untouched (still `F.linear`) — the hard fused-matmul sub-phase has NOT started.
+
+### Sub-task 0 — load-time guard for the `data_ptr()`-is-the-`MTLBuffer` contract
+
+The blind `(__bridge id<MTLBuffer>)` cast rides on an **undocumented** torch internal. Hardened with a
+cheap **one-time** check at native-library load (`MpsBNBNativeLibrary.verify_buffer_contract()` →
+`extern "C" bnb_mps_check_buffer_contract`): it takes a real MPS tensor's `data_ptr()` + its byte size
+and confirms the pointer resolves to a genuine `id<MTLBuffer>` (protocol conformance + `[length]` ≥
+size), guarded by `@try/@catch`. If a future torch breaks the contract, `get_mps_library()` **disables
+the native path and logs a clear, actionable error** (falls back to pure-torch — no crash, no silent
+corruption); `BNB_MPS_REQUIRE_NATIVE=1` then turns that into a hard test failure. Verified: real tensor
+→ 1, null pointer → 0, oversize length → 0 (`test_buffer_contract_guard`).
+
+**Unchanged debt (not regressed):** the per-call offset-0 copy of inputs, and the wheel-packaging gap
+(metallib/dylib not yet force-included in a wheel). `gemv_4bit`/`gemm_4bit` fused matmul and the
+int8/optimizer ops remain out of scope.

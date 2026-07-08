@@ -93,8 +93,8 @@ class TestBlockwise8bitParity:
     @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
     @pytest.mark.parametrize("blocksize", BLOCKSIZES)
     def test_dequantize_blockwise(self, dtype, blocksize):
-        # NOTE: there is no "mps" registration for dequantize_blockwise; this runs
-        # through the "default" (pure-torch) kernel on mps tensors.
+        # As of Phase 3 there IS an mps registration for dequantize_blockwise: native Metal
+        # when built, else the same pure-torch compute the default backend uses.
         torch.manual_seed(1337)
         A = torch.randn(256, 256, dtype=dtype)
         code = F.create_dynamic_map().to(torch.float32)
@@ -135,8 +135,19 @@ class TestBlockwise8bitParity:
         assert err_mps == pytest.approx(err_cpu, rel=0.02)
 
 
+def _require_native():
+    """Skip (or hard-fail under BNB_MPS_REQUIRE_NATIVE=1) when the native lib is absent."""
+    if not _NATIVE_AVAILABLE:
+        if _REQUIRE_NATIVE:
+            pytest.fail(
+                "BNB_MPS_REQUIRE_NATIVE=1 but the native MPS library did not load. "
+                "Build it: cmake -DCOMPUTE_BACKEND=mps -S . -B . && cmake --build . --config Release"
+            )
+        pytest.skip("Native MPS library not built (using Hub/pure-torch fallback).")
+
+
 class TestNativeMetalPath:
-    """Phase-2 verification: quantize_blockwise through the hand-written Metal kernel.
+    """Native-Metal verification: quant/dequant ops through the hand-written kernels.
 
     These assert the native path is exercised (not a fallback) and stays bit-exact vs the
     CPU oracle. When the native library is not built, they skip -- unless
@@ -145,16 +156,30 @@ class TestNativeMetalPath:
     """
 
     def test_native_library_loaded(self):
-        if not _NATIVE_AVAILABLE:
-            if _REQUIRE_NATIVE:
-                pytest.fail(
-                    "BNB_MPS_REQUIRE_NATIVE=1 but the native MPS library did not load. "
-                    "Build it: cmake -DCOMPUTE_BACKEND=mps -S . -B . && cmake --build . --config Release"
-                )
-            pytest.skip("Native MPS library not built (using Hub/pure-torch fallback).")
+        _require_native()
         from bitsandbytes.cextension import get_mps_library
 
         assert get_mps_library() is not None
+
+    def test_buffer_contract_guard(self):
+        """The data_ptr()-is-the-MTLBuffer guard: passes for a real MPS tensor, rejects
+        a bogus pointer and an oversized length. A future torch that breaks the contract
+        must be caught here rather than corrupting a Metal dispatch."""
+        _require_native()
+        import ctypes as ct
+
+        from bitsandbytes.cextension import get_mps_library
+
+        lib = get_mps_library()
+        # Re-running the load-time verification must not raise on this torch.
+        lib.verify_buffer_contract()
+
+        t = torch.empty(64, dtype=torch.float32, device="mps")
+        torch.mps.synchronize()
+        check = lib._lib.bnb_mps_check_buffer_contract
+        assert check(ct.c_void_p(t.data_ptr()), ct.c_int64(t.numel() * 4)) == 1
+        assert check(ct.c_void_p(0), ct.c_int64(0)) == 0  # null pointer rejected
+        assert check(ct.c_void_p(t.data_ptr()), ct.c_int64(10**9)) == 0  # oversize rejected
 
     @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
     @pytest.mark.parametrize("blocksize", BLOCKSIZES)
@@ -195,8 +220,85 @@ class TestNativeMetalPath:
         assert_bit_exact(q_mps, q_cpu)
         assert torch.equal(absmax_mps.cpu(), absmax_cpu)
 
-    def test_graceful_fallback_when_native_absent(self, monkeypatch):
-        """With the native lib forced off, quantize_blockwise must still work (pure-torch)."""
+    # ---- Phase 3: dequantize_blockwise (newly registered on mps), + the 4-bit ops ----
+
+    @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
+    @pytest.mark.parametrize("blocksize", BLOCKSIZES)
+    def test_dequantize_blockwise_native(self, dtype, blocksize):
+        _require_native()
+        torch.manual_seed(1337)
+        A = torch.randn(256, 256, dtype=dtype)
+        code = F.create_dynamic_map().to(torch.float32)
+        q, absmax = torch.ops.bitsandbytes.quantize_blockwise(A, code, blocksize)
+
+        dq_cpu = torch.ops.bitsandbytes.dequantize_blockwise(q, absmax, code, blocksize, dtype)
+        dq_mps = torch.ops.bitsandbytes.dequantize_blockwise(
+            q.to("mps"), absmax.to("mps"), code.to("mps"), blocksize, dtype
+        )
+        # fp32 kernel + a torch .to(dtype) cast reproduces the reference exactly.
+        assert dq_mps.dtype == dtype
+        assert torch.equal(dq_mps.cpu(), dq_cpu)
+
+    @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
+    @pytest.mark.parametrize("quant_type", ["nf4", "fp4"])
+    @pytest.mark.parametrize("blocksize", BLOCKSIZES)
+    @pytest.mark.parametrize("storage_dtype", [torch.uint8, torch.bfloat16], ids=id_formatter("storage"))
+    def test_quantize_4bit_native(self, dtype, quant_type, blocksize, storage_dtype):
+        _require_native()
+        torch.manual_seed(1337)
+        A = torch.randn(256, 256, dtype=dtype)
+
+        q_cpu, absmax_cpu = torch.ops.bitsandbytes.quantize_4bit(A, blocksize, quant_type, storage_dtype)
+        q_mps, absmax_mps = torch.ops.bitsandbytes.quantize_4bit(A.to("mps"), blocksize, quant_type, storage_dtype)
+
+        assert q_mps.dtype == storage_dtype
+        assert q_mps.shape == q_cpu.shape
+        # Packed nibbles bit-exact (view-as-uint8 avoids NaN!=NaN on the bf16 reinterpret).
+        assert_bit_exact(q_mps, q_cpu)
+        assert torch.equal(absmax_mps.cpu(), absmax_cpu)
+
+    @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
+    @pytest.mark.parametrize("quant_type", ["nf4", "fp4"])
+    @pytest.mark.parametrize("blocksize", BLOCKSIZES)
+    def test_dequantize_4bit_native(self, dtype, quant_type, blocksize):
+        _require_native()
+        torch.manual_seed(1337)
+        shape = (256, 256)
+        A = torch.randn(shape, dtype=dtype)
+        q, absmax = torch.ops.bitsandbytes.quantize_4bit(A, blocksize, quant_type, torch.uint8)
+
+        dq_cpu = torch.ops.bitsandbytes.dequantize_4bit(q, absmax, blocksize, quant_type, shape, dtype)
+        dq_mps = torch.ops.bitsandbytes.dequantize_4bit(
+            q.to("mps"), absmax.to("mps"), blocksize, quant_type, shape, dtype
+        )
+        assert dq_mps.shape == shape
+        assert dq_mps.dtype == dtype
+        assert torch.equal(dq_mps.cpu(), dq_cpu)
+
+    @pytest.mark.parametrize("quant_type", ["nf4", "fp4"])
+    @pytest.mark.parametrize("blocksize", [64, 128, 256])
+    def test_4bit_native_partial_block_bit_exact(self, quant_type, blocksize):
+        """Odd-numel tail (the padding nibble) is bit-exact for quantize AND dequantize."""
+        _require_native()
+        torch.manual_seed(1337)
+        shape = (7, blocksize - 1)  # numel not divisible by blocksize; odd for odd blocksize-1
+        A = torch.randn(shape, dtype=torch.float32)
+
+        q_cpu, am_cpu = torch.ops.bitsandbytes.quantize_4bit(A, blocksize, quant_type, torch.uint8)
+        q_mps, am_mps = torch.ops.bitsandbytes.quantize_4bit(A.to("mps"), blocksize, quant_type, torch.uint8)
+        assert_bit_exact(q_mps, q_cpu)
+        assert torch.equal(am_mps.cpu(), am_cpu)
+
+        dq_cpu = torch.ops.bitsandbytes.dequantize_4bit(q_cpu, am_cpu, blocksize, quant_type, shape, torch.float32)
+        dq_mps = torch.ops.bitsandbytes.dequantize_4bit(q_mps, am_mps, blocksize, quant_type, shape, torch.float32)
+        assert torch.equal(dq_mps.cpu(), dq_cpu)
+
+    @pytest.mark.parametrize(
+        "op",
+        ["quantize_blockwise", "dequantize_blockwise", "quantize_4bit", "dequantize_4bit"],
+    )
+    def test_graceful_fallback_when_native_absent(self, monkeypatch, op):
+        """With the native handle forced off, every graduated op still works (pure-torch)."""
         if _mps_ops is None:
             pytest.skip("mps backend ops not importable.")
 
@@ -204,15 +306,33 @@ class TestNativeMetalPath:
         assert _mps_ops._native_available() is False
 
         torch.manual_seed(1337)
-        A = torch.randn(256, 256, dtype=torch.float32)
         code = F.create_dynamic_map().to(torch.float32)
+        A = torch.randn(256, 256, dtype=torch.float32)
 
-        q_cpu, absmax_cpu = torch.ops.bitsandbytes.quantize_blockwise(A, code, 128)
-        q_mps, absmax_mps = torch.ops.bitsandbytes.quantize_blockwise(A.to("mps"), code.to("mps"), 128)
-
-        # Pure-torch fallback is also bit-exact (proven in Phase 1).
-        assert_bit_exact(q_mps, q_cpu)
-        assert_parity(absmax_mps, absmax_cpu, torch.float32)
+        if op == "quantize_blockwise":
+            q_cpu, am_cpu = torch.ops.bitsandbytes.quantize_blockwise(A, code, 128)
+            q_mps, am_mps = torch.ops.bitsandbytes.quantize_blockwise(A.to("mps"), code.to("mps"), 128)
+            assert_bit_exact(q_mps, q_cpu)
+            assert_parity(am_mps, am_cpu, torch.float32)
+        elif op == "dequantize_blockwise":
+            q, am = torch.ops.bitsandbytes.quantize_blockwise(A, code, 128)
+            d_cpu = torch.ops.bitsandbytes.dequantize_blockwise(q, am, code, 128, torch.float32)
+            d_mps = torch.ops.bitsandbytes.dequantize_blockwise(
+                q.to("mps"), am.to("mps"), code.to("mps"), 128, torch.float32
+            )
+            assert_parity(d_mps, d_cpu, torch.float32)
+        elif op == "quantize_4bit":
+            q_cpu, am_cpu = torch.ops.bitsandbytes.quantize_4bit(A, 64, "nf4", torch.uint8)
+            q_mps, am_mps = torch.ops.bitsandbytes.quantize_4bit(A.to("mps"), 64, "nf4", torch.uint8)
+            assert_bit_exact(q_mps, q_cpu)
+            assert_parity(am_mps, am_cpu, torch.float32)
+        else:  # dequantize_4bit
+            q, am = torch.ops.bitsandbytes.quantize_4bit(A, 64, "nf4", torch.uint8)
+            d_cpu = torch.ops.bitsandbytes.dequantize_4bit(q, am, 64, "nf4", (256, 256), torch.float32)
+            d_mps = torch.ops.bitsandbytes.dequantize_4bit(
+                q.to("mps"), am.to("mps"), 64, "nf4", (256, 256), torch.float32
+            )
+            assert_parity(d_mps, d_cpu, torch.float32)
 
 
 class Test4bitParity:

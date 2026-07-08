@@ -19,6 +19,7 @@ from ..._ops import register_kernel
 from ...cextension import get_mps_library
 from ..default.ops import (
     _dequantize_4bit_compute,
+    _dequantize_blockwise_compute,
     _get_4bit_quantize_bounds,
     _try_torch_compile,
 )
@@ -31,7 +32,7 @@ _mps_native = get_mps_library()
 
 
 def _native_available() -> bool:
-    """Whether the native Metal quantize_blockwise kernel is usable on this install."""
+    """Whether the hand-written Metal quant/dequant kernels are usable on this install."""
     return _mps_native is not None
 
 
@@ -109,10 +110,11 @@ def _quantize_blockwise_native(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route quantize_blockwise through the hand-written Metal kernel.
 
-    Mirrors the reference math exactly (per-block absmax, reciprocal-scale, searchsorted
-    into the code table). Inputs are forced to fp32/offset-0 to match the kernel's ABI.
-    torch.mps.synchronize() flushes torch's stream so the native command buffer (on a
-    separate queue) reads materialized inputs; the .mm blocks on completion before return.
+    Mirrors the reference math exactly (per-block absmax; reciprocal-multiply on full blocks,
+    direct divide + clamped absmax on the tail block; searchsorted into the code table).
+    Inputs are forced to fp32/offset-0 to match the kernel's ABI. torch.mps.synchronize()
+    flushes torch's stream so the native command buffer (on a separate queue) reads
+    materialized inputs; the .mm blocks on completion before return.
     """
     A_flat = _ensure_native_buffer(A.reshape(-1).to(torch.float32))
     code_f = _ensure_native_buffer(code.to(torch.float32))
@@ -141,6 +143,46 @@ def _(A: torch.Tensor, code: torch.Tensor, blocksize: int) -> tuple[torch.Tensor
         return _quantize_blockwise_native(A, code, blocksize)
     q, absmax = _quantize_blockwise_compute(A.reshape(-1).float(), code.float(), blocksize)
     return q.reshape(A.shape), absmax
+
+
+def _dequantize_blockwise_native(
+    A: torch.Tensor, absmax: torch.Tensor, code: torch.Tensor, blocksize: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Route dequantize_blockwise through the hand-written Metal kernel.
+
+    The kernel computes out[i] = code[A[i]] * absmax[i // blocksize] in fp32; Python casts to
+    the requested dtype (matching the reference's trailing .to(dtype)).
+    """
+    A_flat = _ensure_native_buffer(A.reshape(-1))
+    if A_flat.dtype != torch.uint8:
+        A_flat = _ensure_native_buffer(A_flat.view(torch.uint8))
+    code_f = _ensure_native_buffer(code.to(torch.float32))
+    absmax_f = _ensure_native_buffer(absmax.to(torch.float32))
+
+    n = A_flat.numel()
+    out = torch.empty(n, dtype=torch.float32, device=A.device)
+
+    torch.mps.synchronize()
+    _mps_native.bnb_mps_dequantize_blockwise(
+        code_f.data_ptr(),
+        A_flat.data_ptr(),
+        absmax_f.data_ptr(),
+        out.data_ptr(),
+        n,
+        blocksize,
+    )
+
+    return out.reshape(A.shape).to(dtype)
+
+
+# NOTE: dequantize_blockwise was previously MISSING on the mps backend (fell through to the
+# "default" pure-torch kernel). This adds a real mps registration -- native when available,
+# else the same pure-torch compute the default backend uses.
+@register_kernel("bitsandbytes::dequantize_blockwise", "mps")
+def _(A: torch.Tensor, absmax: torch.Tensor, code: torch.Tensor, blocksize: int, dtype: torch.dtype) -> torch.Tensor:
+    if _native_available():
+        return _dequantize_blockwise_native(A, absmax, code, blocksize, dtype)
+    return _dequantize_blockwise_compute(A.reshape(-1), absmax, code, blocksize, dtype).reshape(A.shape)
 
 
 @_try_torch_compile(dynamic=True)
@@ -184,6 +226,43 @@ def _quantize_4bit_fallback(
     return packed, absmax
 
 
+def _quantize_4bit_native(
+    A: torch.Tensor, blocksize: int, quant_type: str, quant_storage: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route quantize_4bit (NF4/FP4) through the hand-written Metal kernel.
+
+    `bounds` are the 15 midpoints of the sorted code; `order` remaps the searchsorted index
+    back to the stored 4-bit index (identity for NF4, argsort for FP4). The kernel packs pairs
+    into bytes (high nibble = even element). Storage-dtype reinterpret mirrors the reference.
+    """
+    bounds, order = _get_4bit_quantize_bounds(quant_type, A.device)
+    bounds_f = _ensure_native_buffer(bounds.to(torch.float32))
+    order_u8 = _ensure_native_buffer(order.to(torch.uint8))
+    A_flat = _ensure_native_buffer(A.reshape(-1).to(torch.float32))
+
+    n = A_flat.numel()
+    blocks = -(n // -blocksize)
+    n_packed = -(n // -2)  # ceil(n/2)
+    out = torch.empty(n_packed, dtype=torch.uint8, device=A.device)
+    absmax = torch.empty(blocks, dtype=torch.float32, device=A.device)
+
+    torch.mps.synchronize()
+    _mps_native.bnb_mps_quantize_4bit(
+        bounds_f.data_ptr(),
+        order_u8.data_ptr(),
+        A_flat.data_ptr(),
+        out.data_ptr(),
+        absmax.data_ptr(),
+        n,
+        blocksize,
+    )
+
+    packed = out.unsqueeze(1)
+    if quant_storage != torch.uint8:
+        packed = packed.squeeze().view(quant_storage).unsqueeze(1)
+    return packed, absmax
+
+
 @register_kernel("bitsandbytes::quantize_4bit", "mps")
 def _(
     A: torch.Tensor,
@@ -191,11 +270,47 @@ def _(
     quant_type: str,
     quant_storage: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _native_available():
+        return _quantize_4bit_native(A, blocksize, quant_type, quant_storage)
     if blocksize in (64, 128, 256, 512) and (k := _get_kernel()) is not None:
         packed, absmax = k.quantize_4bit(A.contiguous(), blocksize, _QUANT_MAP[quant_type])
         packed = packed.view(quant_storage).unsqueeze(1)
         return packed, absmax
     return _quantize_4bit_fallback(A, blocksize, quant_type, quant_storage)
+
+
+def _dequantize_4bit_native(
+    A: torch.Tensor,
+    absmax: torch.Tensor,
+    blocksize: int,
+    quant_type: str,
+    shape: Sequence[int],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Route dequantize_4bit (NF4/FP4) through the hand-written Metal kernel.
+
+    out[j] = code4[nibble_j] * absmax[j // blocksize] in fp32; Python casts to dtype and
+    reshapes (matching the reference). `A` holds packed nibbles; `absmax` is the plain
+    per-block scale (nested/compressed absmax is unpacked by the caller before this op).
+    """
+    A_flat = _ensure_native_buffer(A.reshape(-1))
+    code_f = _ensure_native_buffer(_get_4bit_code(quant_type, A.device).to(torch.float32))
+    absmax_f = _ensure_native_buffer(absmax.to(torch.float32))
+
+    n = prod(shape)
+    out = torch.empty(n, dtype=torch.float32, device=A.device)
+
+    torch.mps.synchronize()
+    _mps_native.bnb_mps_dequantize_4bit(
+        code_f.data_ptr(),
+        A_flat.data_ptr(),
+        absmax_f.data_ptr(),
+        out.data_ptr(),
+        n,
+        blocksize,
+    )
+
+    return out.reshape(shape).to(dtype)
 
 
 def _dequantize_4bit_impl(
@@ -208,6 +323,10 @@ def _dequantize_4bit_impl(
 ) -> torch.Tensor:
     if A.dtype != torch.uint8:
         A = A.view(torch.uint8)
+
+    # Native hand-written Metal kernel when available (any blocksize).
+    if _native_available():
+        return _dequantize_4bit_native(A, absmax, blocksize, quant_type, shape, dtype)
 
     # Use HF Hub kernel when supported.
     if blocksize in (64, 128, 256, 512) and (k := _get_kernel()) is not None:
