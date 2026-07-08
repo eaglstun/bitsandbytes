@@ -1,117 +1,178 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#define HLF_MAX 65504
-#define TH 1024
-#define NUM 4
-#define NUM_BLOCK 4096
+// Hand-written blockwise quant/dequant kernels, written to match the CPU/default reference
+// in bitsandbytes/backends/default/ops.py bit-for-bit.
+//
+// Shared reference conventions (see quantize_blockwise / quantize_4bit in default/ops.py):
+//   - Per-block absmax = max(|A[i]|) over the block.
+//   - FULL blocks (length == blocksize): stored absmax is the raw (unclamped) max, and
+//     scaling is reciprocal-then-multiply: scaled = A * (1 / max(absmax, 1e-38)).
+//   - The TAIL block (the last block when n % blocksize != 0, length < blocksize): stored
+//     absmax is max clamped to 1e-38, and scaling is a DIRECT divide: scaled = A / absmax.
+//     This asymmetry is in the reference; reproducing it is required for bit-exact absmax
+//     and codes on partial-block inputs.
+//   - scaled is clamped to [-1, 1] before the code lookup.
+//   - Code lookup reproduces torch.bucketize(..., right=False): searchsorted-left, i.e. the
+//     number of bounds strictly less than `scaled`.
+//
+// The metallib is compiled with -fno-fast-math (see CMakeLists.txt) so division is correctly
+// rounded and no FMA contraction occurs -- this is what keeps bucket selection identical to
+// the CPU oracle.
 
-template<bool STOCHASTIC>
-static unsigned char quantize_scalar(
-  float rand,
-  device float* code,
-  float x)
-{
-    int pivot = 127;
-    int upper_pivot = 255;
-    int lower_pivot = 0;
-
-    float lower = -1.0f;
-    float upper = 1.0f;
-
-    float val = code[pivot];
-    // i>>=1 = {32, 16, 8, 4, 2, 1}
-    for(int i = 64; i > 0; i>>=1)
-    {
-        if(x > val)
-        {
-            lower_pivot = pivot;
-            lower = val;
-            pivot+=i;
+// searchsorted-left over `n_bounds` ascending bounds; returns an index in [0, n_bounds].
+static inline uint searchsorted_left(float scaled, device const float* bounds, uint n_bounds) {
+    uint lo = 0;
+    uint hi = n_bounds;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1;
+        if (bounds[mid] < scaled) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
-        else
-        {
-            upper_pivot = pivot;
-            upper = val;
-            pivot-=i;
-        }
-        val = code[pivot];
+    }
+    return lo;
+}
+
+// ---- 8-bit blockwise quantize: A (float32) -> out (uint8 codes) + absmax (float32) ----
+kernel void quantize_blockwise(
+    device const float* code [[buffer(0)]],  // 256-entry sorted code table
+    device const float* A [[buffer(1)]],
+    device uchar* out [[buffer(2)]],
+    device float* absmax [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant uint& blocksize [[buffer(5)]],
+    uint block_id [[thread_position_in_grid]]
+) {
+    const uint start = block_id * blocksize;
+    if (start >= n) {
+        return;
+    }
+    const uint end = min(start + blocksize, n);
+    const bool is_tail = (end - start) < blocksize;
+
+    float amax = 0.0f;
+    for (uint i = start; i < end; ++i) {
+        amax = fmax(amax, fabs(A[i]));
     }
 
-    if(upper_pivot == 255)
-        upper = code[upper_pivot];
-    if(lower_pivot == 0)
-        lower = code[lower_pivot];
+    // Tail block stores clamped absmax and divides; full block stores raw and reciprocal-multiplies.
+    const float stored = is_tail ? fmax(amax, 1e-38f) : amax;
+    absmax[block_id] = stored;
+    const float inv = 1.0f / fmax(amax, 1e-38f);
 
-    if(!STOCHASTIC)
-    {
-      if(x > val)
-      {
-        float midpoint = (upper+val)*0.5f;
-        if(x > midpoint)
-        {
-          return upper_pivot;
+    for (uint i = start; i < end; ++i) {
+        const float scaled = clamp(is_tail ? (A[i] / stored) : (A[i] * inv), -1.0f, 1.0f);
+        // 255 midpoint bounds of the 256-entry code table, computed on the fly.
+        uint lo = 0;
+        uint hi = 255;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            const float bound = (code[mid] + code[mid + 1]) * 0.5f;
+            if (bound < scaled) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-        else
-          return pivot;
-      }
-      else
-      {
-        float midpoint = (lower+val)*0.5f;
-        if(x < midpoint)
-          return lower_pivot;
-        else
-          return pivot;
-      }
-    }
-    else
-    {
-      if(x > val)
-      {
-        float dist_to_upper = fabs(upper-x);
-        float dist_full = upper-val;
-        if(rand >= dist_to_upper/dist_full) return upper_pivot;
-        else return pivot;
-      }
-      else
-      {
-        float dist_to_lower = fabs(lower-x);
-        float dist_full = val-lower;
-        if(rand >= dist_to_lower/dist_full) return lower_pivot;
-        else return pivot;
-      }
+        out[i] = (uchar)lo;
     }
 }
 
-kernel void quantize(device float* code [[buffer(0)]],
-                      device float* A [[buffer(1)]],
-                      device uchar* out [[buffer(2)]],
-                      constant uint& n [[buffer(3)]],
-                      uint id [[thread_position_in_grid]]) {
-  const uint n_full = (NUM_BLOCK * (n / NUM_BLOCK)) + (n % NUM_BLOCK == 0 ? 0 : NUM_BLOCK);
-  uint valid_items = (id / NUM_BLOCK + 1 == (n + NUM_BLOCK - 1) / NUM_BLOCK) ? n - (id / NUM_BLOCK * NUM_BLOCK) : NUM_BLOCK;
-  const uint base_idx = (id / NUM_BLOCK * NUM_BLOCK);
-
-  float vals[NUM];
-  uchar qvals[NUM];
-
-  for (uint i = base_idx; i < n_full; i += ((n + NUM_BLOCK - 1) / NUM_BLOCK) * NUM_BLOCK) {
-    valid_items = n - i > NUM_BLOCK ? NUM_BLOCK : n - i;
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint j = 0; j < valid_items; j++) {
-      vals[j] = A[i + j];
+// ---- 8-bit blockwise dequantize: A (uint8 codes) + absmax -> out (float32) ----
+// out[i] = code[A[i]] * absmax[i / blocksize]. The Python wrapper casts fp32 out to the
+// requested dtype (matching the reference's trailing .to(dtype)).
+kernel void dequantize_blockwise(
+    device const float* code [[buffer(0)]],  // 256-entry code table
+    device const uchar* A [[buffer(1)]],
+    device const float* absmax [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant uint& blocksize [[buffer(5)]],
+    uint block_id [[thread_position_in_grid]]
+) {
+    const uint start = block_id * blocksize;
+    if (start >= n) {
+        return;
     }
-
-    for (uint j = 0; j < valid_items; j++) {
-      qvals[j] = quantize_scalar<false>(0.0f, code, vals[j]);
+    const uint end = min(start + blocksize, n);
+    const float am = absmax[block_id];
+    for (uint i = start; i < end; ++i) {
+        out[i] = code[A[i]] * am;
     }
+}
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint j = 0; j < valid_items; j++) {
-      out[i + j] = qvals[j];
+// ---- 4-bit blockwise dequantize (NF4/FP4): packed A -> out (float32) ----
+// Nibble layout matches the reference: high nibble -> even output index, low nibble -> odd.
+//   out[j] = code4[nibble_j] * absmax[j / blocksize]
+kernel void dequantize_4bit(
+    device const float* code [[buffer(0)]],  // 16-entry 4-bit code (NF4 or FP4)
+    device const uchar* A [[buffer(1)]],     // packed nibbles, ceil(n/2) bytes
+    device const float* absmax [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant uint& blocksize [[buffer(5)]],
+    uint block_id [[thread_position_in_grid]]
+) {
+    const uint start = block_id * blocksize;
+    if (start >= n) {
+        return;
     }
-  }
+    const uint end = min(start + blocksize, n);
+    const float am = absmax[block_id];
+    for (uint j = start; j < end; ++j) {
+        const uint byte = j >> 1;
+        const uchar nib = ((j & 1u) == 0u) ? (A[byte] >> 4) : (A[byte] & 0x0Fu);
+        out[j] = code[nib] * am;
+    }
+}
+
+// ---- 4-bit blockwise quantize (NF4/FP4): A (float32) -> packed out + absmax ----
+// `bounds` are the 15 midpoints of the SORTED 16-entry code; `order` maps the searchsorted
+// index back to the stored 4-bit index (identity for NF4, the argsort remap for FP4).
+// blocksize is even, so element pairs never cross block boundaries: each block packs its own
+// bytes at output offset (start / 2), padding a final odd element's low nibble with 0 (as the
+// reference does at the end of the whole array).
+kernel void quantize_4bit(
+    device const float* bounds [[buffer(0)]],  // 15 ascending midpoints
+    device const uchar* order [[buffer(1)]],   // 16-entry remap
+    device const float* A [[buffer(2)]],
+    device uchar* out [[buffer(3)]],
+    device float* absmax [[buffer(4)]],
+    constant uint& n [[buffer(5)]],
+    constant uint& blocksize [[buffer(6)]],
+    uint block_id [[thread_position_in_grid]]
+) {
+    const uint start = block_id * blocksize;
+    if (start >= n) {
+        return;
+    }
+    const uint end = min(start + blocksize, n);
+    const bool is_tail = (end - start) < blocksize;
+
+    float amax = 0.0f;
+    for (uint i = start; i < end; ++i) {
+        amax = fmax(amax, fabs(A[i]));
+    }
+    const float stored = is_tail ? fmax(amax, 1e-38f) : amax;
+    absmax[block_id] = stored;
+    const float inv = 1.0f / fmax(amax, 1e-38f);
+
+    const uint len = end - start;
+    const uint nbytes = (len + 1u) >> 1;
+    const uint byte_base = start >> 1;
+    for (uint k = 0; k < nbytes; ++k) {
+        const uint hi_idx = start + 2u * k;
+        const uint lo_idx = hi_idx + 1u;
+
+        const float hs = clamp(is_tail ? (A[hi_idx] / stored) : (A[hi_idx] * inv), -1.0f, 1.0f);
+        const uchar hi = order[searchsorted_left(hs, bounds, 15)];
+
+        // For an odd-length tail block the final low nibble is padding: the reference pads
+        // `scaled` with 0.0 and quantizes THAT (not a literal 0), so match it.
+        const float ls = (lo_idx < end) ? clamp(is_tail ? (A[lo_idx] / stored) : (A[lo_idx] * inv), -1.0f, 1.0f) : 0.0f;
+        const uchar lo = order[searchsorted_left(ls, bounds, 15)];
+        out[byte_base + k] = (uchar)((hi << 4) | lo);
+    }
 }
