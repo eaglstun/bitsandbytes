@@ -292,6 +292,52 @@ def test_lion32bit_weight_decay(dim1, dim2, gtype, device):
             p2.copy_(p1.data)
 
 
+# bf16 is excluded: its ~8-bit mantissa rounds the bug's per-element (2 * lr) update
+# difference away on param write-back, so coupled and decoupled Lion8bit are numerically
+# indistinguishable in bf16 regardless of correctness. fp32/fp16 resolve it cleanly.
+@pytest.mark.parametrize("gtype", [torch.float32, torch.float16], ids=describe_dtype)
+@pytest.mark.parametrize("dim1", [1024], ids=id_formatter("dim1"))
+@pytest.mark.parametrize("dim2", [32, 1024], ids=id_formatter("dim2"))
+@pytest.mark.parametrize("device", get_available_devices(), ids=id_formatter("device"))
+def test_lion8bit_blockwise_weight_decay(dim1, dim2, gtype, device):
+    """Lion8bit must also use *decoupled* weight decay, like the 32-bit path.
+
+    Companion to test_lion32bit_weight_decay, covering the 8-bit blockwise kernels. The
+    Triton 1-state blockwise kernel gated its decoupled-decay branch on OPTIMIZER_ID == 2
+    (ADAGRAD) rather than 4 (LION), so Lion fell through to the coupled (L2) fold and its
+    sign update was computed from a decay-polluted gradient.
+
+    Params are *not* resynced between steps: the coupled-vs-decoupled difference is a
+    small per-step signal that only becomes reliably measurable once it accumulates. The
+    budgets sit well above the correct path's 8-bit quantization noise and far below the
+    error the coupled-decay bug produces (measured ~1.3e-3 in fp32, ~1.5e-3 in fp16).
+    """
+    if device == "mps":
+        # The 8-bit blockwise optimizer op is not implemented for MPS (the existing
+        # test_optimizer8bit hits the same gap); there is nothing to exercise here.
+        pytest.skip("optimizer_update_8bit_blockwise is not implemented for the MPS device")
+
+    weight_decay = 0.1
+    err_budget = 1e-4 if gtype == torch.float32 else 4e-4
+
+    p1 = torch.randn(dim1, dim2, device=device, dtype=gtype) * 0.1
+    p2 = p1.clone()
+    p1 = p1.float()
+
+    torch_optimizer = Lion([p1], weight_decay=weight_decay)
+    bnb_optimizer = bnb.optim.Lion8bit([p2], weight_decay=weight_decay)
+
+    for i in range(k):
+        g = torch.randn(dim1, dim2, device=device, dtype=gtype) * 0.01
+        p1.grad = g.clone().float()
+        p2.grad = g.clone()
+
+        torch_optimizer.step()
+        bnb_optimizer.step()
+
+        assert (p1 - p2.float()).abs().mean().item() < err_budget
+
+
 @pytest.mark.parametrize("dim1", [1024], ids=id_formatter("dim1"))
 @pytest.mark.parametrize("dim2", [32, 1024, 4097], ids=id_formatter("dim2"))
 @pytest.mark.parametrize("gtype", [torch.float32, torch.float16], ids=describe_dtype)
