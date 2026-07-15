@@ -917,8 +917,11 @@ def _optimizer_update_1state_8bit_blockwise_triton_kernel(
     s1 = dequant_8bit_blockwise_kernel_util(state1_ptr, offsets, qmap1_ptr, absmax1_ptr, mask, BLOCK_SIZE_N)
 
     # 3. Optimizer-specific updates
-    # LION
-    if weight_decay > 0.0 and OPTIMIZER_ID == 2:
+    # LION (id 4) uses decoupled weight decay: shrink the param directly, outside the
+    # sign update (Chen et al. 2023). This was previously gated on OPTIMIZER_ID == 2,
+    # which is ADAGRAD -- so Lion got coupled decay (corrupting its sign update) and
+    # Adagrad got decoupled decay instead of the L2 fold it expects.
+    if weight_decay > 0.0 and OPTIMIZER_ID == 4:
         p *= 1.0 - lr * weight_decay
     # Apply weight decay for momentum, rmsprop, adagrad
     elif weight_decay > 0.0:
