@@ -630,3 +630,145 @@ def _(
             gnorm_scale,
             optimizer_id,
         )
+
+
+def _dequantize_state_fp32(
+    codes: torch.Tensor, absmax: torch.Tensor, qmap: torch.Tensor, blocksize: int
+) -> torch.Tensor:
+    return torch.ops.bitsandbytes.dequantize_blockwise(codes, absmax, qmap, blocksize, torch.float32)
+
+
+def _quantize_state_inplace(
+    values_fp32: torch.Tensor, qmap: torch.Tensor, codes_out: torch.Tensor, absmax_out: torch.Tensor, blocksize: int
+) -> None:
+    codes, absmax = torch.ops.bitsandbytes.quantize_blockwise(values_fp32, qmap, blocksize)
+    codes_out.copy_(codes)
+    absmax_out.copy_(absmax)
+
+
+@register_kernel("bitsandbytes::optimizer_update_8bit_blockwise", "default")
+def _(
+    optimizer_name: str,
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2: Optional[torch.Tensor],
+    beta1: float,
+    beta2: float,
+    beta3: float,
+    alpha: float,
+    eps: float,
+    step: int,
+    lr: float,
+    qmap1: torch.Tensor,
+    qmap2: Optional[torch.Tensor],
+    absmax1: torch.Tensor,
+    absmax2: Optional[torch.Tensor],
+    weight_decay: float,
+    gnorm_scale: float,
+    skip_zeros: bool = False,
+) -> None:
+    """
+    Device-agnostic pure-PyTorch 8-bit blockwise optimizer update.
+
+    Ports the math of ``backends/cpu/ops.py::_optimizer_update_8bit_blockwise_cpu``
+    exactly, but re/dequantizes the optimizer state through
+    ``torch.ops.bitsandbytes.{de,}quantize_blockwise`` so it runs on any device
+    (cpu, mps, ...). Structure: dequantize state (uint8 codes + per-block absmax +
+    qmap -> fp32), apply the optimizer update in fp32, requantize the state in
+    place (new codes + new absmax). Weight decay is decoupled for adam/lamb/
+    ademamix/lion, coupled (into the gradient) for momentum/lars/rmsprop/adagrad,
+    matching the cpu and CUDA kernels.
+    """
+    if skip_zeros:
+        raise NotImplementedError("skip_zeros is not supported yet")
+
+    blocksize = 256
+
+    # Dequantize states
+    if optimizer_name == "ademamix" and absmax1.ndim == 2:
+        # state1 is stacked [m1, m2] with a (2, blocks) absmax
+        s1_1 = _dequantize_state_fp32(state1[0], absmax1[0], qmap1, blocksize)
+        s1_2 = _dequantize_state_fp32(state1[1], absmax1[1], qmap1, blocksize)
+        state1_fp32 = torch.stack([s1_1, s1_2])
+    else:
+        state1_fp32 = _dequantize_state_fp32(state1, absmax1, qmap1, blocksize)
+
+    state2_fp32 = None
+    if state2 is not None and qmap2 is not None and absmax2 is not None:
+        state2_fp32 = _dequantize_state_fp32(state2, absmax2, qmap2, blocksize)
+
+    grad = g.float() * gnorm_scale
+    p_fp32 = p.data.float()
+
+    if optimizer_name in ("adam", "lamb"):
+        state1_fp32.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+        state2_fp32.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+        correction1 = 1.0 - beta1**step
+        correction2 = sqrt(1.0 - beta2**step)
+
+        denom = (state2_fp32.sqrt() / correction2).add_(eps)
+        if weight_decay > 0.0:
+            p_fp32.mul_(1.0 - lr * weight_decay)
+        p_fp32.addcdiv_(state1_fp32, denom, value=-lr / correction1)
+
+    elif optimizer_name == "ademamix":
+        m1_fp32, m2_fp32 = state1_fp32[0], state1_fp32[1]
+        nu_fp32 = state2_fp32
+
+        m1_fp32.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+        m2_fp32.mul_(beta3).add_(grad, alpha=1.0 - beta3)
+        nu_fp32.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+        correction1 = 1.0 - beta1**step
+        correction2 = sqrt(1.0 - beta2**step)
+
+        update = (m1_fp32 / correction1 + alpha * m2_fp32) / (nu_fp32.sqrt() / correction2 + eps)
+        if weight_decay > 0.0:
+            p_fp32.mul_(1.0 - lr * weight_decay)
+        p_fp32.add_(update, alpha=-lr)
+
+        state1_fp32 = torch.stack([m1_fp32, m2_fp32])
+
+    elif optimizer_name in ("momentum", "lars"):
+        grad.add_(p_fp32, alpha=weight_decay)
+        if step == 1:
+            state1_fp32.copy_(grad)
+        else:
+            state1_fp32.mul_(beta1).add_(grad)
+        p_fp32.add_(state1_fp32, alpha=-lr)
+
+    elif optimizer_name == "lion":
+        if weight_decay > 0.0:
+            p_fp32.mul_(1.0 - lr * weight_decay)
+
+        update_dir = torch.sign(state1_fp32.mul(beta1) + grad.mul(1.0 - beta1))
+        p_fp32.add_(update_dir, alpha=-lr)
+
+        state1_fp32.mul_(beta2).add_(grad, alpha=1.0 - beta2)
+
+    elif optimizer_name == "rmsprop":
+        grad.add_(p_fp32, alpha=weight_decay)
+        state1_fp32.mul_(beta1).addcmul_(grad, grad, value=1.0 - beta1)
+        p_fp32.addcdiv_(grad, state1_fp32.sqrt().add_(eps), value=-lr)
+
+    elif optimizer_name == "adagrad":
+        grad.add_(p_fp32, alpha=weight_decay)
+        state1_fp32.addcmul_(grad, grad, value=1.0)
+        p_fp32.addcdiv_(grad, state1_fp32.sqrt().add_(eps), value=-lr)
+
+    else:
+        raise ValueError(f"Unsupported optimizer for 8-bit blockwise update: {optimizer_name}")
+
+    p.data.copy_(p_fp32)
+
+    # Re-quantize states in place
+    if optimizer_name == "ademamix":
+        _quantize_state_inplace(state1_fp32[0], qmap1, state1[0], absmax1[0], blocksize)
+        _quantize_state_inplace(state1_fp32[1], qmap1, state1[1], absmax1[1], blocksize)
+        _quantize_state_inplace(state2_fp32, qmap2, state2, absmax2, blocksize)
+    else:
+        _quantize_state_inplace(state1_fp32, qmap1, state1, absmax1, blocksize)
+        if state2_fp32 is not None:
+            _quantize_state_inplace(state2_fp32, qmap2, state2, absmax2, blocksize)

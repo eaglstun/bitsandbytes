@@ -958,6 +958,168 @@ class TestOptimizerParity:
         assert_parity(state1_mps, state1, torch.float32)
 
 
+# 8-bit blockwise optimizer state layout constants (fixed by the op contract).
+_OPT8BIT_BLOCKSIZE = 256
+_OPT8BIT_2STATE = ("adam", "ademamix")
+
+
+def _make_optimizer_8bit_inputs(optimizer_name: str, dtype: torch.dtype, device: str, n: int = 4096):
+    """Seeded op inputs for optimizer_update_8bit_blockwise, identical across devices.
+
+    Everything is generated on cpu from a fixed seed and then moved, so cpu and mps
+    runs start from bit-identical tensors. State layout mirrors
+    ``Optimizer2State/Optimizer1State.init_state``: uint8 zero codes, fp32 zero
+    per-block absmax, signed dynamic qmap for state1 and unsigned for state2
+    (second moments are non-negative). AdEMAMix stacks state1 as [m1, m2] with a
+    (2, blocks) absmax1.
+    """
+    torch.manual_seed(1337)
+    blocks = n // _OPT8BIT_BLOCKSIZE
+
+    g = torch.randn(n, dtype=dtype)
+    p = torch.randn(n, dtype=dtype)
+
+    if optimizer_name == "ademamix":
+        state1 = torch.zeros(2, n, dtype=torch.uint8)
+        absmax1 = torch.zeros(2, blocks, dtype=torch.float32)
+    else:
+        state1 = torch.zeros(n, dtype=torch.uint8)
+        absmax1 = torch.zeros(blocks, dtype=torch.float32)
+    qmap1 = F.create_dynamic_map(signed=True).to(torch.float32)
+
+    if optimizer_name in _OPT8BIT_2STATE:
+        state2 = torch.zeros(n, dtype=torch.uint8)
+        absmax2 = torch.zeros(blocks, dtype=torch.float32)
+        qmap2 = F.create_dynamic_map(signed=False).to(torch.float32)
+    else:
+        state2, absmax2, qmap2 = None, None, None
+
+    move = lambda t: t.to(device) if t is not None else None
+    return tuple(move(t) for t in (g, p, state1, state2, qmap1, qmap2, absmax1, absmax2))
+
+
+def _dequant_state(codes, absmax, qmap):
+    if codes is None:
+        return None
+    if absmax.ndim == 2:  # ademamix stacked [m1, m2]; keyed off absmax, since codes
+        # simply mirror the param shape (a 2-D param gives 2-D codes with 1-D absmax)
+        return torch.stack(
+            [
+                torch.ops.bitsandbytes.dequantize_blockwise(
+                    codes[i], absmax[i], qmap, _OPT8BIT_BLOCKSIZE, torch.float32
+                )
+                for i in range(codes.shape[0])
+            ]
+        )
+    return torch.ops.bitsandbytes.dequantize_blockwise(codes, absmax, qmap, _OPT8BIT_BLOCKSIZE, torch.float32)
+
+
+class TestOptimizer8bitBlockwiseParity:
+    """Phase O1: optimizer_update_8bit_blockwise runs on mps via the pure-torch
+    "default" kernel and matches the cpu oracle.
+
+    The cpu run resolves to the dedicated "cpu" kernel (backends/cpu/ops.py); the
+    mps run resolves to the new device-agnostic "default" kernel
+    (backends/default/ops.py). Both implement the same reference math, so today
+    they agree to fp32 rounding (measured max diff ~5e-7, state codes bit-exact).
+    The assertions are still tolerance-based, NOT bit-exact: the state round-trips
+    through 8-bit quantization, and the Phase-O2 native Metal kernel is allowed to
+    diverge in ulps as long as it stays inside PARITY_TOLERANCE.
+    """
+
+    @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
+    @pytest.mark.parametrize(
+        "optimizer_name", ["adam", "momentum", "rmsprop", "lion", "adagrad", "ademamix"], ids=id_formatter("opt")
+    )
+    def test_optimizer_update_8bit_blockwise(self, optimizer_name, dtype):
+        results = {}
+        for device in ("cpu", "mps"):
+            g, p, state1, state2, qmap1, qmap2, absmax1, absmax2 = _make_optimizer_8bit_inputs(
+                optimizer_name, dtype, device
+            )
+            for step in (1, 2, 3, 4, 5):
+                torch.ops.bitsandbytes.optimizer_update_8bit_blockwise(
+                    optimizer_name,
+                    g,
+                    p,
+                    state1,
+                    state2,
+                    0.9,  # beta1
+                    0.999,  # beta2
+                    0.9999,  # beta3 (ademamix)
+                    5.0,  # alpha (ademamix)
+                    1e-8,  # eps
+                    step,
+                    1e-3,  # lr
+                    qmap1,
+                    qmap2,
+                    absmax1,
+                    absmax2,
+                    0.01,  # weight_decay
+                    1.0,  # gnorm_scale
+                )
+            results[device] = (
+                p,
+                _dequant_state(state1, absmax1, qmap1),
+                _dequant_state(state2, absmax2, qmap2),
+                absmax1,
+                absmax2,
+            )
+
+        p_cpu, s1_cpu, s2_cpu, am1_cpu, am2_cpu = results["cpu"]
+        p_mps, s1_mps, s2_mps, am1_mps, am2_mps = results["mps"]
+
+        assert_parity(p_mps, p_cpu, dtype)
+        # Dequantized state is compared at the run's compute-dtype tolerance, not
+        # fp32-tight: with fp16/bf16 grads, a state value can land exactly on a
+        # quantization-bucket midpoint, and a 1-ulp cpu-vs-mps fp32 difference then
+        # flips it by one bucket (measured: 2/4096 elements for bf16 adam, abs diff
+        # ~2e-4). absmax stays fp32-tight -- it never round-trips through 8 bits.
+        assert_parity(s1_mps, s1_cpu, dtype)
+        assert_parity(am1_mps, am1_cpu, torch.float32)
+        if s2_cpu is not None:
+            assert_parity(s2_mps, s2_cpu, dtype)
+            assert_parity(am2_mps, am2_cpu, torch.float32)
+
+    @pytest.mark.parametrize("optim_name", ["Adam8bit", "Lion8bit"])
+    def test_optimizer_8bit_end_to_end(self, optim_name):
+        """Full bnb.optim.{Adam8bit,Lion8bit} steps agree between cpu and mps.
+
+        Exercises the real optimizer stack (init_state -> F.optimizer_update_8bit_blockwise
+        -> the torch.ops dispatch), not just the raw op. Param must be >= 4096 elements,
+        the default min_8bit_size, or the optimizer silently falls back to 32-bit state.
+        """
+        import bitsandbytes as bnb
+
+        optim_cls = getattr(bnb.optim, optim_name)
+
+        torch.manual_seed(42)
+        p0 = torch.randn(64, 64, dtype=torch.float32)
+        grads = [torch.randn(64, 64, dtype=torch.float32) for _ in range(3)]
+
+        results = {}
+        for device in ("cpu", "mps"):
+            p = torch.nn.Parameter(p0.clone().to(device))
+            optim = optim_cls([p], lr=1e-3)
+            for grad in grads:
+                p.grad = grad.to(device)
+                optim.step()
+            state = optim.state[p]
+            assert state["state1"].dtype == torch.uint8, "expected 8-bit state (numel >= min_8bit_size)"
+            results[device] = (
+                p.detach(),
+                _dequant_state(state["state1"], state["absmax1"], state["qmap1"]),
+                state["absmax1"],
+            )
+
+        p_cpu, s1_cpu, am1_cpu = results["cpu"]
+        p_mps, s1_mps, am1_mps = results["mps"]
+
+        assert_parity(p_mps, p_cpu, torch.float32)
+        assert_parity(s1_mps, s1_cpu, torch.float32)
+        assert_parity(am1_mps, am1_cpu, torch.float32)
+
+
 class TestKnownGapsOnMps:
     """Ops with no "mps" and no "default" registration must fail loudly on mps.
 
@@ -982,14 +1144,6 @@ class TestKnownGapsOnMps:
         with pytest.raises(NotImplementedError):
             torch.ops.bitsandbytes.int8_double_quant(A)
 
-    def test_optimizer_update_8bit_blockwise_missing(self):
-        g = torch.randn(256, device="mps")
-        p = torch.randn(256, device="mps")
-        state1 = torch.zeros(256, dtype=torch.uint8, device="mps")
-        qmap = F.create_dynamic_map(signed=True).to("mps")
-        absmax = torch.zeros(1, device="mps")
-
-        with pytest.raises(NotImplementedError):
-            torch.ops.bitsandbytes.optimizer_update_8bit_blockwise(
-                "adam", g, p, state1, None, 0.9, 0.999, 0.0, 0.0, 1e-8, 1, 1e-3, qmap, None, absmax, None, 0.0, 1.0
-            )
+    # NOTE: optimizer_update_8bit_blockwise used to be pinned here as a known gap.
+    # As of Phase O1 it has a device-agnostic "default" registration (pure torch),
+    # so it no longer raises on mps -- see TestOptimizer8bitBlockwiseParity above.
