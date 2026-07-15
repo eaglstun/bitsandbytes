@@ -477,6 +477,65 @@ def _(
     out.copy_(result)
 
 
+def _gemm_4bit_native(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    shapeB: Sequence[int],
+    absmax: torch.Tensor,
+    blocksize: int,
+    quant_type: str,
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Route gemm_4bit (general M) through the native Metal entry point.
+
+    One command buffer, one commit, one blocking wait: a chunked Metal kernel dequantizes
+    packed B into a private scratch MTLBuffer in A's dtype (reproducing the reference's
+    B_dq.to(dtype) rounding), MPSMatrixMultiplication computes A[M,K] . B_dq[N,K]^T, and an
+    optional bias epilogue adds bias[N] -- all on the same command buffer. Compared with the
+    dequant + F.linear fallback this removes the torch round-trip and its second sync (the
+    per-call cross-queue sync is what dominates wall-clock at small/medium M -- see the
+    Phase M2 finding in MPS_STATUS.md).
+
+    `absmax` must already be the plain per-block fp32 scale: nested/compressed absmax is
+    unpacked by the caller BEFORE this function. Preconditions (checked by the caller):
+    A.dtype is fp32/fp16 (MPSMatrixMultiplication asserts on bf16), K % 32 == 0, and
+    power-of-two blocksize >= 32.
+    """
+    N, K = int(shapeB[0]), int(shapeB[-1])
+    M = A.numel() // K
+
+    B_flat = B if B.dtype == torch.uint8 else B.view(torch.uint8)
+    B_flat = _ensure_native_buffer(B_flat.reshape(-1))
+    A_flat = _ensure_native_buffer(A.reshape(-1))
+    code_f = _ensure_native_buffer(_get_4bit_code(quant_type, A.device).to(torch.float32))
+    absmax_f = _ensure_native_buffer(absmax.to(torch.float32))
+    bias_ptr = None
+    if bias is not None:
+        bias_f = _ensure_native_buffer(bias.reshape(-1))
+        bias_ptr = bias_f.data_ptr()
+
+    out = torch.empty(M * N, dtype=A.dtype, device=A.device)
+    dtype_flag = {torch.float32: 0, torch.float16: 1}[A.dtype]
+    bs_shift = blocksize.bit_length() - 1
+
+    torch.mps.synchronize()
+    _mps_native.bnb_mps_gemm_4bit(
+        code_f.data_ptr(),
+        B_flat.data_ptr(),
+        absmax_f.data_ptr(),
+        A_flat.data_ptr(),
+        bias_ptr,
+        out.data_ptr(),
+        M,
+        K,
+        N,
+        bs_shift,
+        dtype_flag,
+    )
+
+    return out.reshape(*A.shape[:-1], N)
+
+
 @register_kernel("bitsandbytes::gemm_4bit", "mps")
 def _(
     A: torch.Tensor,
@@ -501,6 +560,26 @@ def _(
             torch.ops.bitsandbytes.dequantize_blockwise.default(absmax_8bit, absmax, absmax_code, 256, torch.float32)
             + absmax_offset
         )
+
+    # Native Metal path (dequant -> scratch -> MPSMatrixMultiplication -> bias, one command
+    # buffer / one sync). Guards: fp32/fp16 only (MPSMatrixMultiplication hard-asserts on
+    # bf16 -- verified on macOS 26.4.1 -- so bf16 keeps the dequant + F.linear fallback),
+    # 2-D shapeB matching A's K, K % 32 == 0 (uint4 loads in the chunked dequant kernel),
+    # power-of-two blocksize (absmax indexed with a shift), a bias matching out's dtype and
+    # width, and packed B of the expected size.
+    if (
+        _native_available()
+        and hasattr(_mps_native._lib, "bnb_mps_gemm_4bit")  # stale dylibs predate the native gemm
+        and A.dtype in (torch.float32, torch.float16)
+        and len(shapeB) == 2
+        and shapeB[-1] == K
+        and K % 32 == 0
+        and blocksize >= 32
+        and (blocksize & (blocksize - 1)) == 0
+        and (bias is None or (bias.dtype == A.dtype and bias.numel() == N))
+        and B.numel() * B.element_size() == (N * K) // 2
+    ):
+        return _gemm_4bit_native(A, B, shapeB, absmax, blocksize, quant_type, bias)
 
     # Use HF Hub kernel when supported for GEMV.
     if M == 1 and blocksize in (64, 128, 256) and (k := _get_kernel()) is not None:

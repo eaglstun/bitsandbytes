@@ -424,6 +424,30 @@ on that materialized `B_dq`. Bench scripts: `scratchpad/bench_matmul_baseline.py
 > (~0.15–0.25ms, the Phase-2 discipline) now dominates wall-clock at these sizes. Bench:
 > `benchmarks_wip/bench_gemv_fused.py`.
 
+> **Phase M3 result (2026-07-14, short note — full docs in Phase M4):** `gemm_4bit` (general M)
+> now runs native per the M1 decision (Option A): `bnb_mps_gemm_4bit` in `csrc/mps_ops.mm` encodes,
+> on **one command buffer / one commit / one blocking wait**, (1) a chunked dequant kernel
+> (`dequantize_4bit_chunked_fp32/fp16`, one thread per 32-element uint4 chunk, writing
+> `(T)(code[nib]*absmax)` into a growable **private scratch MTLBuffer** — same rounding as the
+> oracle's `B_dq.to(dtype)`), (2) a shape-cached `MPSMatrixMultiplication` `A[M,K]·B_dq[N,K]ᵀ`
+> (row-major, `transposeRight=YES`), and (3) an optional `out[m,n] += bias[n]` epilogue kernel.
+> The single sync is the structural win over dequant+`F.linear`, which pays the cross-queue sync
+> twice. **bf16 is excluded by the router:** `MPSMatrixMultiplication` hard-asserts on anything but
+> fp32/fp16/int8/int16 (probed on macOS 26.4.1: "Input data type must be one of MPSDataTypeFloat32,
+> MPSDataTypeFloat16, MPSDataTypeInt8, or MPSDataTypeInt16"), so bf16 keeps the dequant+`F.linear`
+> fallback verbatim (still parity-green). Router guards otherwise mirror the fused gemv: K % 32 == 0,
+> power-of-two blocksize ≥ 32, packed-size check; nested absmax is unpacked to plain fp32 absmax
+> before routing, unchanged. Parity: `test_mps_parity.py -k "gemm_4bit or gemv"` **69 passed** under
+> `BNB_MPS_REQUIRE_NATIVE=1` (native asserted via spy incl. ±bias/±nested-absmax; bf16 and
+> K%32≠0 fallbacks asserted; fp32 vs MPSMatMul accumulation stayed within the documented 1e-5 atol
+> at the calibrated K ≤ 256 — the one tolerance trip found was in the **pure-torch** fallback
+> composition at K=256/M=4, so the graceful-fallback test pins K=64 like the main gemm test).
+> Wall-clock vs the dequant+`F.linear` fallback (nf4/bs64, N=K=4096, 30 iters):
+> fp16 **2.5x** (M=8: 0.47ms vs 1.20ms), **1.5x** (M=64 and M=512), **1.08x** (M=2048);
+> fp32 **1.6x/1.5x** (M=8/64), **1.1x** (M=512), **~1.0x** (M=2048). As predicted, the win is the
+> single sync + a much faster chunked dequant at small/medium M, and flat at M=2048 where the GEMM
+> itself dominates and MPSMatMul ≈ `F.linear`'s GEMM. Bench: `benchmarks_wip/bench_gemm_baseline.py`.
+
 **Load-bearing caveat for the kernel author.** The existing dequant kernel moves ~40 MB in ~0.75ms ≈
 **54 GB/s**, on hardware that sustains ~400 GB/s — it's leaving ~85% of memory bandwidth on the floor.
 Both matmul routes inherit this: a fused `gemv` kernel that reads packed B no faster than the current

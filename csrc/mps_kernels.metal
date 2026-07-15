@@ -234,6 +234,72 @@ BNB_GEMV_4BIT_KERNEL(gemv_4bit_fp32, float)
 BNB_GEMV_4BIT_KERNEL(gemv_4bit_fp16, half)
 BNB_GEMV_4BIT_KERNEL(gemv_4bit_bf16, bfloat)
 
+// ---- Phase M3: chunked 4-bit dequant into the ACTIVATION dtype (gemm_4bit scratch) ----
+// Fills the scratch B_dq consumed by MPSMatrixMultiplication in bnb_mps_gemm_4bit. One
+// thread per 32-element chunk (16 packed bytes, one uint4 load), writing
+// (T)(code[nib] * absmax) -- the same rounding as the reference's B_dq.to(dtype), so the
+// GEMM multiplies exactly the weights the oracle multiplies. Preconditions match the fused
+// gemv kernel (enforced by the Python router): K % 32 == 0 so rows are 16-byte aligned and
+// total elements are a multiple of 32; blocksize is a power of two >= 32 (bs_shift =
+// log2(blocksize)), so a chunk never straddles an absmax block.
+template <typename T>
+static inline void dequantize_4bit_chunked_body(
+    device const float* code,
+    device const uchar* B,
+    device const float* absmax,
+    device T* out,
+    uint bs_shift,
+    uint chunk) {
+    const ulong base = (ulong)chunk << 5;  // first element index of this chunk
+    device const uint4* p = (device const uint4*)(B + (base >> 1));
+    const uint4 packed = *p;
+    const float am = absmax[base >> bs_shift];
+
+#pragma unroll
+    for (uint w = 0; w < 4; ++w) {
+        const uint word = packed[w];
+        // Little-endian: byte b of `word` is packed byte (base/2 + w*4 + b), holding
+        // elements base + w*8 + 2b (high nibble) and base + w*8 + 2b + 1 (low nibble).
+#pragma unroll
+        for (uint b = 0; b < 4; ++b) {
+            const uint byte = (word >> (b << 3)) & 0xFFu;
+            const ulong j = base + (ulong)((w << 3) | (b << 1));
+            out[j] = (T)(code[byte >> 4] * am);
+            out[j + 1] = (T)(code[byte & 0x0Fu] * am);
+        }
+    }
+}
+
+#define BNB_DEQUANT_4BIT_CHUNKED_KERNEL(NAME, T)                                                                     \
+    kernel void NAME(                                                                                                \
+        device const float* code [[buffer(0)]],   /* 16-entry 4-bit code (NF4 or FP4) */                            \
+        device const uchar* B [[buffer(1)]],      /* packed nibbles, row-major [N, K], N*K/2 bytes */               \
+        device const float* absmax [[buffer(2)]], /* per-block scales over the flattened [N*K] index */             \
+        device T* out [[buffer(3)]],              /* N*K elements of T (the GEMM scratch) */                        \
+        constant uint& bs_shift [[buffer(4)]],    /* log2(blocksize) */                                             \
+        uint chunk [[thread_position_in_grid]]) {                                                                   \
+        dequantize_4bit_chunked_body<T>(code, B, absmax, out, bs_shift, chunk);                                      \
+    }
+
+BNB_DEQUANT_4BIT_CHUNKED_KERNEL(dequantize_4bit_chunked_fp32, float)
+BNB_DEQUANT_4BIT_CHUNKED_KERNEL(dequantize_4bit_chunked_fp16, half)
+
+// ---- Phase M3: bias epilogue for gemm_4bit ----
+// out[m, n] += bias[n], broadcast over rows, in the activation dtype (reproducing
+// F.linear's bias add on the T-typed matmul result). 2-D grid: x = n (column), y = m (row).
+#define BNB_GEMM_BIAS_ADD_KERNEL(NAME, T)                                                                            \
+    kernel void NAME(                                                                                                \
+        device T* out [[buffer(0)]],           /* [M, N] row-major */                                               \
+        device const T* bias [[buffer(1)]],    /* [N] */                                                            \
+        constant uint& N [[buffer(2)]],                                                                              \
+        uint2 gid [[thread_position_in_grid]]) {                                                                     \
+        const ulong idx = (ulong)gid.y * (ulong)N + (ulong)gid.x;                                                    \
+        out[idx] = (T)(out[idx] + bias[gid.x]);                                                                      \
+    }
+
+BNB_GEMM_BIAS_ADD_KERNEL(gemm_bias_add_fp32, float)
+BNB_GEMM_BIAS_ADD_KERNEL(gemm_bias_add_fp16, half)
+
 // ---- 4-bit blockwise quantize (NF4/FP4): A (float32) -> packed out + absmax ----
 // `bounds` are the 15 midpoints of the SORTED 16-entry code; `order` maps the searchsorted
 // index back to the stored 4-bit index (identity for NF4, the argsort remap for FP4).
