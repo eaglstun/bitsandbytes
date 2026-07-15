@@ -367,3 +367,53 @@ the _installed_ package. Confirmed against the installed wheel:
 **Still open (not this task):** the wheel is a plain-tagged platform wheel; CI matrix / release
 automation to actually publish MPS wheels is a separate concern. The per-call offset-0 input copy and
 the fused 4-bit matmuls remain as documented above.
+
+---
+
+## 10. Phase M1 — 4-bit matmul baseline + A/B decision (spike)
+
+**Status: measured. Decision made.** This is the `NEXT_MATMUL_PLAN.md` Phase M1 spike, but done
+against the _real_ baseline (today's `dequant → F.linear`) rather than an unbuilt native route — the
+numbers decide the design fork on their own, so no throwaway MPSMatMul wiring was needed to choose.
+
+**Method.** `torch.mps.synchronize()`-bracketed timing, warmup + 30–50 iters, native dequant forced
+(`BNB_MPS_REQUIRE_NATIVE=1`), nf4/blocksize-64. Per shape we isolate the two costs inside today's
+unfused path: the native Metal **dequant of B** (materializes full `B_dq`) and the **`F.linear`** GEMM
+on that materialized `B_dq`. Bench scripts: `scratchpad/bench_matmul_baseline.py`,
+`bench_gemm_baseline.py` (not committed; reproduce from the numbers here).
+
+**gemv (M=1), fp16/bf16** — dequant is the whole cost:
+
+| N     | K     | total  | dequant | linear | dequant share |
+| ----- | ----- | ------ | ------- | ------ | ------------- |
+| 4096  | 4096  | 0.94ms | 0.75ms  | 0.07ms | ~80%          |
+| 11008 | 4096  | 1.80ms | ~2.0ms  | 0.19ms | ~90%+         |
+| 4096  | 11008 | 1.81ms | 1.63ms  | 0.21ms | ~90%          |
+
+**gemm (N=K=4096, fp16), sweeping M** — fixed dequant floor, GEMM overtakes it near M≈512:
+
+| M    | total  | dequant | linear | GEMM share |
+| ---- | ------ | ------- | ------ | ---------- |
+| 8    | 1.41ms | 0.80ms  | 0.10ms | 7%         |
+| 64   | 1.21ms | 0.88ms  | 0.42ms | 35%        |
+| 512  | 2.50ms | 0.73ms  | 1.27ms | 51%        |
+| 2048 | 5.66ms | 0.76ms  | 4.85ms | 86%        |
+
+**Decision (per-op, as the plan anticipated — now with evidence):**
+
+- **`gemv_4bit` (M=1) → Option B (hand-fused dequant+matmul).** 80–90% dequant-bound; Option A
+  (`MPSMatrixMultiplication` on materialized `B_dq`) would only touch the ~10% GEMM slice. Fusion —
+  never writing `B_dq` to device memory — is the entire win. This is Phase M2.
+- **`gemm_4bit` large M (≥~512) → Option A (`MPSMatrixMultiplication`).** GEMM dominates; do not try to
+  out-GEMM Apple's tuned kernel by hand. Accept the fixed ~0.75ms dequant tax. This is Phase M3.
+- Small-M `gemm` (≤64) is still dequant-bound and behaves like gemv; a fused path helps there too, but
+  M3 defaults to Option A for simplicity and lets the fixed dequant floor stand.
+
+**Load-bearing caveat for the kernel author.** The existing dequant kernel moves ~40 MB in ~0.75ms ≈
+**54 GB/s**, on hardware that sustains ~400 GB/s — it's leaving ~85% of memory bandwidth on the floor.
+Both matmul routes inherit this: a fused `gemv` kernel that reads packed B no faster than the current
+dequant will reproduce the 54 GB/s and win ~nothing. **The M2 target is bandwidth, not "fusion" per se**
+— the fused kernel must read packed B + absmax at close to peak bandwidth (coalesced loads, minimal
+recompute) or it doesn't beat the baseline. (Separately, this implies the standalone dequant kernel is
+itself under-optimized — a possible bigger, simpler lever for the QLoRA M=1 inference case — but that's
+Phase-3 kernel scope, out of this phase's remit.)
