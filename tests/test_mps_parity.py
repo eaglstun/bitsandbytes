@@ -181,6 +181,38 @@ class TestNativeMetalPath:
         assert check(ct.c_void_p(0), ct.c_int64(0)) == 0  # null pointer rejected
         assert check(ct.c_void_p(t.data_ptr()), ct.c_int64(10**9)) == 0  # oversize rejected
 
+    def test_view_data_ptr_is_base_plus_offset(self):
+        """Pins the pointer semantics that force the offset-0 clone in _ensure_native_buffer
+        (verified in Phase M4): for an MPS view with storage_offset != 0, data_ptr() is
+        base_ptr + storage_offset * itemsize -- raw pointer arithmetic, NOT an id<MTLBuffer>
+        (casting it would be a miscast; even objc-probing such an interior pointer
+        SIGSEGVs). The base buffer object IS recoverable via untyped_storage().data_ptr(),
+        which is the documented recipe should offset binding ever be implemented. If this
+        test fails, torch changed the contract -- re-verify _ensure_native_buffer before
+        trusting the native ops."""
+        _require_native()
+        import ctypes as ct
+
+        from bitsandbytes.cextension import get_mps_library
+
+        lib = get_mps_library()
+        check = lib._lib.bnb_mps_check_buffer_contract
+
+        base = torch.arange(1024, dtype=torch.float32, device="mps")
+        view = base[128:]
+        torch.mps.synchronize()
+
+        # A view's data_ptr() is base + offset bytes (raw arithmetic, not an objc object)...
+        assert view.storage_offset() == 128
+        assert view.data_ptr() - base.data_ptr() == 128 * base.element_size()
+        # ...while the storage's data_ptr() is the base allocation, which IS the MTLBuffer.
+        storage = view.untyped_storage()
+        assert storage.data_ptr() == base.data_ptr()
+        assert check(ct.c_void_p(storage.data_ptr()), ct.c_int64(storage.nbytes())) == 1
+        # Deliberately NOT calling check() on view.data_ptr(): an interior pointer is not
+        # an objc object, and probing it segfaults (uncatchable by @try/@catch) -- which is
+        # exactly why _ensure_native_buffer must keep cloning offset != 0 views.
+
     @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
     @pytest.mark.parametrize("blocksize", BLOCKSIZES)
     def test_quantize_blockwise_native_bit_exact(self, dtype, blocksize):
@@ -293,9 +325,260 @@ class TestNativeMetalPath:
         dq_mps = torch.ops.bitsandbytes.dequantize_4bit(q_mps, am_mps, blocksize, quant_type, shape, torch.float32)
         assert torch.equal(dq_mps.cpu(), dq_cpu)
 
+    # ---- Phase M2: fused gemv_4bit (dequant + dot product in one Metal kernel) ----
+
+    @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
+    @pytest.mark.parametrize("quant_type", ["nf4", "fp4"])
+    @pytest.mark.parametrize("blocksize", [64, 256])
+    def test_gemv_4bit_native_fused(self, dtype, quant_type, blocksize, monkeypatch):
+        """gemv_4bit routes through the fused native Metal kernel (asserted via a spy, not
+        assumed) and matches the CPU oracle within the documented per-dtype tolerances."""
+        _require_native()
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        calls = []
+        orig = _mps_ops._gemv_4bit_native
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return orig(*args, **kwargs)
+
+        monkeypatch.setattr(_mps_ops, "_gemv_4bit_native", spy)
+
+        torch.manual_seed(1337)
+        # K=256 matches the size the fp32 tolerance was calibrated at (accumulation-order
+        # deviation vs the CPU oracle grows with K; at K=512 a single fp32 element lands at
+        # ~1.2e-5, just past the 1e-5 atol -- order noise, not a dequant bug).
+        out_features, in_features = 1024, 256
+        A = torch.randn(1, 1, in_features, dtype=dtype)
+        B = torch.randn(out_features, in_features, dtype=dtype)
+        B_q, absmax = torch.ops.bitsandbytes.quantize_4bit(B, blocksize, quant_type, torch.uint8)
+        code = F.get_4bit_type(quant_type, device="cpu", blocksize=blocksize)
+
+        out_cpu = torch.ops.bitsandbytes.gemv_4bit(A, B_q, B.shape, absmax, code, blocksize)
+        out_mps = torch.ops.bitsandbytes.gemv_4bit(
+            A.to("mps"), B_q.to("mps"), B.shape, absmax.to("mps"), code.to("mps"), blocksize
+        )
+
+        assert calls, "gemv_4bit did not route through the fused native Metal kernel"
+        assert out_mps.shape == (1, 1, out_features)
+        assert out_mps.dtype == dtype
+        assert_parity(out_mps, out_cpu, dtype)
+
+    def test_gemv_4bit_unaligned_k_uses_fallback(self, monkeypatch):
+        """K % 32 != 0 cannot take the fused kernel (uint4 row loads); it must fall back to
+        dequant + F.linear and still be correct."""
+        _require_native()
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        def fail_if_called(*args, **kwargs):
+            pytest.fail("fused native gemv_4bit must not be used when K % 32 != 0")
+
+        monkeypatch.setattr(_mps_ops, "_gemv_4bit_native", fail_if_called)
+
+        torch.manual_seed(1337)
+        out_features, in_features = 128, 80  # K % 32 == 16
+        A = torch.randn(1, 1, in_features, dtype=torch.float32)
+        B = torch.randn(out_features, in_features, dtype=torch.float32)
+        B_q, absmax = torch.ops.bitsandbytes.quantize_4bit(B, 64, "nf4", torch.uint8)
+        code = F.get_4bit_type("nf4", device="cpu", blocksize=64)
+
+        out_cpu = torch.ops.bitsandbytes.gemv_4bit(A, B_q, B.shape, absmax, code, 64)
+        out_mps = torch.ops.bitsandbytes.gemv_4bit(
+            A.to("mps"), B_q.to("mps"), B.shape, absmax.to("mps"), code.to("mps"), 64
+        )
+        assert_parity(out_mps, out_cpu, torch.float32)
+
+    # ---- Phase M3: native gemm_4bit (dequant scratch + MPSMatrixMultiplication + bias) ----
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=describe_dtype)
+    @pytest.mark.parametrize("quant_type", ["nf4", "fp4"])
+    @pytest.mark.parametrize("has_bias", [False, True], ids=id_formatter("has_bias"))
+    @pytest.mark.parametrize("compress_statistics", [False, True], ids=id_formatter("compress_statistics"))
+    def test_gemm_4bit_native(self, dtype, quant_type, has_bias, compress_statistics, monkeypatch):
+        """gemm_4bit routes through the native one-command-buffer Metal path (asserted via a
+        spy) and matches the CPU oracle within the documented per-dtype tolerances. bf16 is
+        excluded: MPSMatrixMultiplication hard-asserts on it (macOS 26.4.1), so bf16 stays on
+        the dequant + F.linear fallback (covered by test_gemm_4bit_bf16_uses_fallback)."""
+        _require_native()
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        calls = []
+        orig = _mps_ops._gemm_4bit_native
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return orig(*args, **kwargs)
+
+        monkeypatch.setattr(_mps_ops, "_gemm_4bit_native", spy)
+
+        torch.manual_seed(1337)
+        # K=256 matches the size the fp32 tolerance was calibrated at (MPSMatrixMultiplication's
+        # accumulation order differs from F.linear's; deviation grows with K).
+        N, K, blocksize = 128, 256, 64
+        A = torch.randn(2, 2, K, dtype=dtype)
+        B = torch.randn(N, K, dtype=dtype)
+        bias = torch.randn(N, dtype=dtype) if has_bias else None
+
+        B_q, qs = bitsandbytes.functional.quantize_4bit(
+            B, blocksize=blocksize, quant_type=quant_type, compress_statistics=compress_statistics
+        )
+        B_q_mps, qs_mps = bitsandbytes.functional.quantize_4bit(
+            B.to("mps"), blocksize=blocksize, quant_type=quant_type, compress_statistics=compress_statistics
+        )
+
+        if compress_statistics:
+            out_cpu = torch.ops.bitsandbytes.gemm_4bit(
+                A,
+                B_q,
+                list(B.shape),
+                qs.state2.absmax,
+                blocksize,
+                quant_type,
+                bias=bias,
+                absmax_8bit=qs.absmax,
+                absmax_code=qs.state2.code,
+                absmax_offset=qs.offset,
+            )
+            out_mps = torch.ops.bitsandbytes.gemm_4bit(
+                A.to("mps"),
+                B_q_mps,
+                list(B.shape),
+                qs_mps.state2.absmax,
+                blocksize,
+                quant_type,
+                bias=bias.to("mps") if bias is not None else None,
+                absmax_8bit=qs_mps.absmax,
+                absmax_code=qs_mps.state2.code,
+                absmax_offset=qs_mps.offset,
+            )
+        else:
+            out_cpu = torch.ops.bitsandbytes.gemm_4bit(
+                A, B_q, list(B.shape), qs.absmax, blocksize, quant_type, bias=bias
+            )
+            out_mps = torch.ops.bitsandbytes.gemm_4bit(
+                A.to("mps"),
+                B_q_mps,
+                list(B.shape),
+                qs_mps.absmax,
+                blocksize,
+                quant_type,
+                bias=bias.to("mps") if bias is not None else None,
+            )
+
+        assert calls, "gemm_4bit did not route through the native Metal path"
+        assert out_mps.shape == (2, 2, N)
+        assert out_mps.dtype == dtype
+        assert_parity(out_mps, out_cpu, dtype)
+
+    def test_gemm_4bit_bf16_uses_fallback(self, monkeypatch):
+        """bf16 must NOT take the native gemm (MPSMatrixMultiplication asserts on bf16); it
+        falls back to dequant + F.linear and stays correct."""
+        _require_native()
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        def fail_if_called(*args, **kwargs):
+            pytest.fail("native gemm_4bit must not be used for bf16 (MPSMatrixMultiplication has no bf16)")
+
+        monkeypatch.setattr(_mps_ops, "_gemm_4bit_native", fail_if_called)
+
+        torch.manual_seed(1337)
+        N, K, blocksize = 128, 256, 64
+        A = torch.randn(2, 2, K, dtype=torch.bfloat16)
+        B = torch.randn(N, K, dtype=torch.bfloat16)
+        B_q, qs = bitsandbytes.functional.quantize_4bit(B, blocksize=blocksize, quant_type="nf4")
+        B_q_mps, qs_mps = bitsandbytes.functional.quantize_4bit(B.to("mps"), blocksize=blocksize, quant_type="nf4")
+
+        out_cpu = torch.ops.bitsandbytes.gemm_4bit(A, B_q, list(B.shape), qs.absmax, blocksize, "nf4")
+        out_mps = torch.ops.bitsandbytes.gemm_4bit(
+            A.to("mps"), B_q_mps, list(B.shape), qs_mps.absmax, blocksize, "nf4"
+        )
+        assert_parity(out_mps, out_cpu, torch.bfloat16)
+
+    def test_gemm_4bit_unaligned_k_uses_fallback(self, monkeypatch):
+        """K % 32 != 0 cannot take the native gemm (uint4 loads in the chunked dequant); it
+        must fall back to dequant + F.linear and still be correct."""
+        _require_native()
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        def fail_if_called(*args, **kwargs):
+            pytest.fail("native gemm_4bit must not be used when K % 32 != 0")
+
+        monkeypatch.setattr(_mps_ops, "_gemm_4bit_native", fail_if_called)
+
+        torch.manual_seed(1337)
+        N, K, blocksize = 128, 80, 64  # K % 32 == 16
+        A = torch.randn(2, 2, K, dtype=torch.float32)
+        B = torch.randn(N, K, dtype=torch.float32)
+        B_q, qs = bitsandbytes.functional.quantize_4bit(B, blocksize=blocksize, quant_type="nf4")
+        B_q_mps, qs_mps = bitsandbytes.functional.quantize_4bit(B.to("mps"), blocksize=blocksize, quant_type="nf4")
+
+        out_cpu = torch.ops.bitsandbytes.gemm_4bit(A, B_q, list(B.shape), qs.absmax, blocksize, "nf4")
+        out_mps = torch.ops.bitsandbytes.gemm_4bit(
+            A.to("mps"), B_q_mps, list(B.shape), qs_mps.absmax, blocksize, "nf4"
+        )
+        assert_parity(out_mps, out_cpu, torch.float32)
+
+    def test_sync_discipline_interleave_stress(self):
+        """Race stress for the cross-queue sync discipline (Phase M4). The native matmuls
+        run on a private MTLCommandQueue, so correctness depends on two syncs:
+        (a) torch.mps.synchronize() BEFORE dispatch -- torch's pending writes into A (the
+            in-place copy_ below is enqueued on torch's stream) must be materialized
+            before the native kernel reads A from the other queue;
+        (b) waitUntilCompleted AFTER commit -- out must be complete before torch reads it.
+        Every iteration enqueues a heavy chained matmul and makes the in-place write into
+        A *depend* on it, so torch's write to A lands late on torch's queue; the native
+        kernel on the other queue then reads A. With the pre-sync removed this fails
+        30/30 iterations (verified empirically in Phase M4 by no-op'ing
+        torch.mps.synchronize); with the discipline intact it must pass every time."""
+        _require_native()
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        torch.manual_seed(1337)
+        dtype = torch.float16
+        N, K, blocksize = 1024, 256, 64
+        B = torch.randn(N, K, dtype=dtype)
+        B_q, absmax = torch.ops.bitsandbytes.quantize_4bit(B, blocksize, "nf4", torch.uint8)
+        code = F.get_4bit_type("nf4", device="cpu", blocksize=blocksize)
+        B_q_mps, absmax_mps, code_mps = B_q.to("mps"), absmax.to("mps"), code.to("mps")
+
+        # Long-lived, reused buffers -- every iteration writes into these in place.
+        Av_mps = torch.zeros(1, 1, K, dtype=dtype, device="mps")
+        Am_mps = torch.zeros(8, K, dtype=dtype, device="mps")
+        heavy = torch.randn(2048, 2048, dtype=dtype, device="mps")
+
+        for _ in range(30):
+            # torch-op phase: heavy chained GPU work, then in-place writes (dependent on
+            # that work, so they land late) into the exact buffers the native kernels are
+            # about to read. No explicit sync here -- the op implementations own the
+            # sync discipline.
+            h = heavy
+            for _ in range(4):
+                h = h @ heavy * 1e-4
+            Av_cpu = torch.randn(1, 1, K, dtype=dtype)
+            Am_cpu = torch.randn(8, K, dtype=dtype)
+            Av_mps.copy_(Av_cpu.to("mps") + 0 * h[0, :K])
+            Am_mps.copy_(Am_cpu.to("mps") + 0 * h[:8, :K])
+
+            # native-op phase: fused gemv + native gemm read A from the private queue.
+            out_v_mps = torch.ops.bitsandbytes.gemv_4bit(Av_mps, B_q_mps, B.shape, absmax_mps, code_mps, blocksize)
+            out_m_mps = torch.ops.bitsandbytes.gemm_4bit(Am_mps, B_q_mps, list(B.shape), absmax_mps, blocksize, "nf4")
+
+            # torch-read phase: consume the native outputs on torch's queue immediately.
+            out_v_cpu = torch.ops.bitsandbytes.gemv_4bit(Av_cpu, B_q, B.shape, absmax, code, blocksize)
+            out_m_cpu = torch.ops.bitsandbytes.gemm_4bit(Am_cpu, B_q, list(B.shape), absmax, blocksize, "nf4")
+            assert_parity(out_v_mps * 2.0, out_v_cpu * 2.0, dtype)
+            assert_parity(out_m_mps * 2.0, out_m_cpu * 2.0, dtype)
+
     @pytest.mark.parametrize(
         "op",
-        ["quantize_blockwise", "dequantize_blockwise", "quantize_4bit", "dequantize_4bit"],
+        ["quantize_blockwise", "dequantize_blockwise", "quantize_4bit", "dequantize_4bit", "gemv_4bit", "gemm_4bit"],
     )
     def test_graceful_fallback_when_native_absent(self, monkeypatch, op):
         """With the native handle forced off, every graduated op still works (pure-torch)."""
@@ -326,13 +609,31 @@ class TestNativeMetalPath:
             q_mps, am_mps = torch.ops.bitsandbytes.quantize_4bit(A.to("mps"), 64, "nf4", torch.uint8)
             assert_bit_exact(q_mps, q_cpu)
             assert_parity(am_mps, am_cpu, torch.float32)
-        else:  # dequantize_4bit
+        elif op == "dequantize_4bit":
             q, am = torch.ops.bitsandbytes.quantize_4bit(A, 64, "nf4", torch.uint8)
             d_cpu = torch.ops.bitsandbytes.dequantize_4bit(q, am, 64, "nf4", (256, 256), torch.float32)
             d_mps = torch.ops.bitsandbytes.dequantize_4bit(
                 q.to("mps"), am.to("mps"), 64, "nf4", (256, 256), torch.float32
             )
             assert_parity(d_mps, d_cpu, torch.float32)
+        elif op == "gemv_4bit":
+            Av = torch.randn(1, 1, 256, dtype=torch.float32)
+            q, am = torch.ops.bitsandbytes.quantize_4bit(A, 64, "nf4", torch.uint8)
+            code4 = F.get_4bit_type("nf4", device="cpu", blocksize=64)
+            o_cpu = torch.ops.bitsandbytes.gemv_4bit(Av, q, (256, 256), am, code4, 64)
+            o_mps = torch.ops.bitsandbytes.gemv_4bit(
+                Av.to("mps"), q.to("mps"), (256, 256), am.to("mps"), code4.to("mps"), 64
+            )
+            assert_parity(o_mps, o_cpu, torch.float32)
+        else:  # gemm_4bit
+            # K=64 keeps fp32 accumulation-order noise (F.linear MPS vs CPU) inside the
+            # documented atol; at K=256 a single element of this M=4 case lands at ~1.4e-5.
+            Am = torch.randn(2, 2, 64, dtype=torch.float32)
+            Bm = torch.randn(64, 64, dtype=torch.float32)
+            q, am = torch.ops.bitsandbytes.quantize_4bit(Bm, 64, "nf4", torch.uint8)
+            o_cpu = torch.ops.bitsandbytes.gemm_4bit(Am, q, [64, 64], am, 64, "nf4")
+            o_mps = torch.ops.bitsandbytes.gemm_4bit(Am.to("mps"), q.to("mps"), [64, 64], am.to("mps"), 64, "nf4")
+            assert_parity(o_mps, o_cpu, torch.float32)
 
 
 class Test4bitParity:

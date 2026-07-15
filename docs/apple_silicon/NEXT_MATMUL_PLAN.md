@@ -165,10 +165,10 @@ either way.
 valid at offset 0. For matmul this copies `A` (and any non-offset-0 operand) every call. Fix: pass each
 tensor's `storage_offset() * itemsize` through the C ABI and bind with `[enc setBuffer:buf offset:byteOff
 atIndex:i]` instead of forcing offset 0 — but first **verify** that a torch MPS view's `data_ptr()` for a
-`storage_offset != 0` tensor is `buffer_object + offset` (a mis-cast) vs the base buffer object; the
+`storage_offset != 0` tensor is `buffer_object + offset` (a miscast) vs the base buffer object; the
 Phase-1 probe suggested the former, so binding the base buffer at a byte offset needs the base pointer,
 which torch may not expose. If it can't be done safely, **leave the copy and document why** — do not ship a
-mis-cast. This is a correctness-sensitive optimization; treat it as such.
+miscast. This is a correctness-sensitive optimization; treat it as such.
 
 ---
 

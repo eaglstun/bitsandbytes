@@ -8,9 +8,14 @@ ground-truth parity audit live alongside it (see [Further reading](#further-read
 
 - **Native, bit-exact:** 4-bit (NF4/FP4) and 8-bit blockwise **quantize / dequantize** run
   on hand-written Metal kernels, each verified bit-exact against the CPU reference.
-- **Works but unfused:** 4-bit (QLoRA-style) **inference** runs end to end, but the 4-bit
-  matmul is **not fused** — quantized weights are dequantized through a Metal kernel and the
-  matmul is then `torch.nn.functional.linear`. Correct, not yet performance-optimized.
+- **Native 4-bit matmul:** `gemv_4bit` (the M=1 inference case) runs through a **fused**
+  Metal kernel (dequant + dot product in registers, the dequantized weight matrix is never
+  materialized) — measured **3.4–6.2x** over the previous dequant+`F.linear` path.
+  `gemm_4bit` (general M) runs natively for **fp16/fp32** (Metal dequant into a scratch
+  buffer + `MPSMatrixMultiplication`, one command buffer): ~**2.5x** at small M, ~1.5x at
+  medium M, and **~parity with `F.linear` at large M** (the GEMM itself dominates there).
+  **bf16 `gemm_4bit` falls back** to dequant+`F.linear` — `MPSMatrixMultiplication` has no
+  bf16 support (verified on macOS 26.4.1). Numbers: `MPS_STATUS.md` §11.
 - **Not supported on `mps`:** LLM.int8() and the 8-bit optimizers (see the matrix below).
 - **Graceful fallback:** if the native library is not present, the `mps` backend
   transparently uses a pure-PyTorch implementation — nothing hard-crashes.
@@ -49,26 +54,29 @@ override the metallib path if needed.
 
 ## Supported-op matrix (`mps`)
 
-| Operation                                            | On `mps`              | Notes                                                                     |
-| ---------------------------------------------------- | --------------------- | ------------------------------------------------------------------------- |
-| `quantize_blockwise` (8-bit)                         | ✅ native Metal       | bit-exact vs CPU; pure-torch fallback                                     |
-| `dequantize_blockwise` (8-bit)                       | ✅ native Metal       | bit-exact vs CPU; pure-torch fallback                                     |
-| `quantize_4bit` (NF4/FP4)                            | ✅ native Metal       | packed nibbles + absmax bit-exact; fallback                               |
-| `dequantize_4bit` (NF4/FP4)                          | ✅ native Metal       | bit-exact vs CPU; fallback                                                |
-| `gemv_4bit` / `gemm_4bit`                            | 〰️ works, **unfused** | native dequant + `torch.nn.functional.linear` (not a fused matmul kernel) |
-| LLM.int8() (`int8_*` ops)                            | ❌ not supported      | `int8_double_quant` raises `NotImplementedError`; no native int8 path     |
-| 8-bit optimizers (`optimizer_update_8bit_blockwise`) | ❌ not supported      | raises `NotImplementedError` on `mps`                                     |
+| Operation                                            | On `mps`              | Notes                                                                                            |
+| ---------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------ |
+| `quantize_blockwise` (8-bit)                         | ✅ native Metal       | bit-exact vs CPU; pure-torch fallback                                                            |
+| `dequantize_blockwise` (8-bit)                       | ✅ native Metal       | bit-exact vs CPU; pure-torch fallback                                                            |
+| `quantize_4bit` (NF4/FP4)                            | ✅ native Metal       | packed nibbles + absmax bit-exact; fallback                                                      |
+| `dequantize_4bit` (NF4/FP4)                          | ✅ native Metal       | bit-exact vs CPU; fallback                                                                       |
+| `gemv_4bit` (M=1 inference)                          | ✅ native Metal       | fused dequant+dot kernel, 3.4–6.2x vs dequant+linear; fallback                                   |
+| `gemm_4bit` (general M)                              | ✅ native (fp16/fp32) | dequant + `MPSMatrixMultiplication`; **bf16 falls back** to dequant+linear; large-M ≈ `F.linear` |
+| LLM.int8() (`int8_*` ops)                            | ❌ not supported      | `int8_double_quant` raises `NotImplementedError`; no native int8 path                            |
+| 8-bit optimizers (`optimizer_update_8bit_blockwise`) | ❌ not supported      | raises `NotImplementedError` on `mps`                                                            |
 
 Legend: ✅ native Metal kernel · 〰️ functional but unfused/unoptimized · ❌ not supported.
 
 ### Native vs fallback vs unsupported
 
-- **Native (Metal):** the four quant/dequant ops above. When
+- **Native (Metal):** the four quant/dequant ops plus the two 4-bit matmuls above. When
   `libbitsandbytes_mps.dylib` + `bitsandbytes.metallib` are present and the load-time
-  buffer-contract check passes, these dispatch to hand-written Metal kernels.
+  buffer-contract check passes, these dispatch to hand-written Metal kernels (the fp16/fp32
+  `gemm_4bit` additionally routes through `MPSMatrixMultiplication`).
 - **Fallback (pure-PyTorch):** any native op automatically falls back to a pure-PyTorch
   implementation when the native library is absent (unbuilt source checkout, or a wheel
-  without the artifacts). The 4-bit matmuls are fallback-shaped by design (dequant + linear).
+  without the artifacts), and the matmuls also fall back for shapes/dtypes the native path
+  does not accept (bf16 `gemm_4bit`, K not a multiple of 32, non-power-of-two blocksize).
 - **Unsupported:** LLM.int8() and the 8-bit optimizers. Do not expect these on `mps` yet.
 
 ## Numerics & correctness
@@ -87,10 +95,21 @@ BNB_MPS_REQUIRE_NATIVE=1 pytest tests/test_mps_parity.py -v
 
 ## Known limitations
 
-- **4-bit matmul is not fused** — dequantize-through-Metal + `F.linear`. A fused
-  `gemv_4bit`/`gemm_4bit` kernel is the next planned work.
-- **Per-call input copy** — native ops force inputs to fresh, offset-0 buffers before
-  dispatch (one copy per call). Correctness-first; an optimization target.
+- **bf16 `gemm_4bit` is not native** — `MPSMatrixMultiplication` supports only
+  fp32/fp16/int8/int16 (verified on macOS 26.4.1), so bf16 batched matmul uses the
+  dequant + `F.linear` fallback. (bf16 `gemv_4bit`, the inference case, IS native/fused.)
+- **Large-M `gemm_4bit` is ~parity, not a win** — at M ≳ 2048 the GEMM itself dominates
+  and `MPSMatrixMultiplication` ≈ `F.linear`'s own GEMM. The native win is small/medium M
+  and gemv.
+- **A fixed ~0.15 ms sync tax per native call** — the native kernels run on their own
+  Metal command queue, so each call pays a command-buffer round trip plus a
+  `torch.mps.synchronize()`. torch exposes no safe handle to its own MPS stream, so this
+  is a documented standing cost (measured breakdown and the full investigation:
+  `MPS_STATUS.md` §11.3). It dominates only the smallest calls.
+- **Per-call input copy for non-fresh views** — native ops clone any input with
+  `storage_offset != 0` (a view's `data_ptr()` is base+offset, not a Metal buffer —
+  verified, see `MPS_STATUS.md` §11.4). Steady-state matmul inputs are offset-0, so this
+  rarely fires.
 - **LLM.int8() and 8-bit optimizers** are not implemented on `mps`.
 
 ## Further reading
@@ -98,5 +117,5 @@ BNB_MPS_REQUIRE_NATIVE=1 pytest tests/test_mps_parity.py -v
 - [`PORT_PLAN.md`](./PORT_PLAN.md) — the full phased implementation spec.
 - [`MPS_STATUS.md`](./MPS_STATUS.md) — ground-truth per-op audit, tolerances, and the
   packaging/verification record.
-- [`NEXT_MATMUL_PLAN.md`](./NEXT_MATMUL_PLAN.md) — the executable spec for the next phase:
-  native 4-bit matmul fusion.
+- [`NEXT_MATMUL_PLAN.md`](./NEXT_MATMUL_PLAN.md) — the executable spec for the native 4-bit
+  matmul phase (completed in Phases M1–M4; results in `MPS_STATUS.md` §10–§11).

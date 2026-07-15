@@ -15,6 +15,7 @@ extend-ignore-re = [
 extend-ignore-identifiers-re = [
     ".*arange.*",
     ".*ARANGE.*",
+    "numer",  # mach_timebase_info_data_t.numer (csrc/mps_ops.mm)
 ]
 
 [type.py.extend-words]

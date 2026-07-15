@@ -1,9 +1,11 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include <cstdint>
 #include <dlfcn.h>
 #include <libgen.h>
+#include <mach/mach_time.h>
 #include <string>
 
 // Native Metal dispatch layer for the bitsandbytes MPS backend.
@@ -132,6 +134,17 @@ extern "C" int bnb_mps_check_buffer_contract(void* ptr, int64_t min_bytes) {
     }
 }
 
+// Host time in seconds on the mach_absolute_time timebase -- the same clock
+// MTLCommandBuffer's GPUStartTime/GPUEndTime report, so the two are directly comparable.
+// Used only by the BNB_MPS_PROFILE probe.
+static double host_time_s() {
+    static mach_timebase_info_data_t tb = {0, 0};
+    if (tb.denom == 0) {
+        mach_timebase_info(&tb);
+    }
+    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
+}
+
 // One thread per block: cap the threadgroup and dispatch a non-uniform grid, then block on
 // completion. dispatchThreads is supported on all Apple Silicon GPUs.
 static void dispatch_per_block(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> pso, int64_t num_blocks) {
@@ -225,6 +238,231 @@ extern "C" void bnb_mps_dequantize_4bit(void* code, void* A, void* absmax, void*
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
+    }
+}
+
+// gemv_4bit (fused dequant + matrix-vector multiply): code (float32[16]), B (uint8 packed,
+// N*K/2 bytes), absmax (float32[blocks]), A (K elements of the activation dtype) ->
+// out (N elements of the activation dtype). One threadgroup of 32 threads (one SIMD-group)
+// per output element. The Python caller guarantees K % 32 == 0 and passes
+// bs_shift = log2(blocksize); dtype_flag (0 = fp32, 1 = fp16, 2 = bf16) selects the kernel
+// variant, so A and out bind directly in torch's dtype (no cast kernels on the torch queue).
+extern "C" void bnb_mps_gemv_4bit(
+    void* code, void* B, void* absmax, void* A, void* out, int64_t K, int64_t N, int64_t bs_shift, int64_t dtype_flag
+) {
+    @autoreleasepool {
+        NSString* name = @"gemv_4bit_fp32";
+        if (dtype_flag == 1) {
+            name = @"gemv_4bit_fp16";
+        } else if (dtype_flag == 2) {
+            name = @"gemv_4bit_bf16";
+        }
+        id<MTLComputePipelineState> pso = get_pipeline(name);
+        id<MTLCommandBuffer> cb = [get_queue() commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+
+        [enc setBuffer:(__bridge id<MTLBuffer>)code offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)B offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)absmax offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)A offset:0 atIndex:3];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:4];
+
+        uint32_t K32 = (uint32_t)K;
+        uint32_t shift32 = (uint32_t)bs_shift;
+        [enc setBytes:&K32 length:sizeof(K32) atIndex:5];
+        [enc setBytes:&shift32 length:sizeof(shift32) atIndex:6];
+
+        // One SIMD-group per output element n.
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)N, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+
+        // Timing probe (BNB_MPS_PROFILE=1): decomposes the blocking call into
+        //   sched = commit -> GPU start (driver/queue scheduling latency)
+        //   gpu   = kernel execution (GPUStartTime..GPUEndTime)
+        //   done  = GPU end -> waitUntilCompleted return (completion delivery)
+        // Wall-clock around the whole ctypes call additionally includes encode (above) and
+        // the caller's torch.mps.synchronize().
+        static const bool profile = getenv("BNB_MPS_PROFILE") != nullptr;
+        const double t_commit = profile ? host_time_s() : 0.0;
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (profile) {
+            const double t_done = host_time_s();
+            const double sched_ms = ([cb GPUStartTime] - t_commit) * 1000.0;
+            const double gpu_ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+            const double done_ms = (t_done - [cb GPUEndTime]) * 1000.0;
+            NSLog(
+                @"bnb_mps_gemv_4bit %@ N=%lld K=%lld sched=%.3fms gpu=%.3fms done=%.3fms", name, (long long)N,
+                (long long)K, sched_ms, gpu_ms, done_ms
+            );
+        }
+    }
+}
+
+// Growable scratch MTLBuffer for gemm_4bit's dequantized B. Private storage (GPU-only) --
+// the CPU never touches B_dq. Safe to reuse a single static buffer because every entry
+// point blocks on waitUntilCompleted before returning, so no two dispatches overlap.
+// (This file is not thread-safe, matching the existing static caches.)
+static id<MTLBuffer> get_scratch(size_t bytes) {
+    static id<MTLBuffer> scratch = nil;
+    if (!scratch || [scratch length] < bytes) {
+        [scratch release];
+        scratch = [get_device() newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
+        if (!scratch) {
+            NSLog(@"bitsandbytes: failed to allocate %zu-byte GEMM scratch buffer", bytes);
+            abort();
+        }
+    }
+    return scratch;
+}
+
+// Shape-keyed MPSMatrixMultiplication cache. Operands are supplied at encode time, so one
+// object per {M, N, K, dtype} can be reused across calls (transformer workloads repeat a
+// few shapes, so the hit rate is high -- the CT2 Metal backend lesson).
+static MPSMatrixMultiplication* get_gemm(int64_t M, int64_t N, int64_t K, int64_t dtype_flag) {
+    static NSMutableDictionary<NSString*, MPSMatrixMultiplication*>* cache = nil;
+    if (!cache) {
+        cache = [[NSMutableDictionary alloc] init];
+    }
+    NSString* key = [NSString
+        stringWithFormat:@"%lld_%lld_%lld_%lld", (long long)M, (long long)N, (long long)K, (long long)dtype_flag];
+    MPSMatrixMultiplication* mm = cache[key];
+    if (mm) {
+        return mm;
+    }
+    // C[M, N] = A[M, K] . B_dq[N, K]^T  (row-major on both sides; MPS is row-major, so no
+    // cuBLAS-style operand swap).
+    mm = [[MPSMatrixMultiplication alloc] initWithDevice:get_device()
+                                           transposeLeft:NO
+                                          transposeRight:YES
+                                              resultRows:(NSUInteger)M
+                                           resultColumns:(NSUInteger)N
+                                         interiorColumns:(NSUInteger)K
+                                                   alpha:1.0
+                                                    beta:0.0];
+    if (!mm) {
+        NSLog(
+            @"bitsandbytes: failed to create MPSMatrixMultiplication (M=%lld N=%lld K=%lld)", (long long)M,
+            (long long)N, (long long)K
+        );
+        abort();
+    }
+    cache[key] = mm;
+    [mm release]; // the cache retains it
+    return mm;
+}
+
+// gemm_4bit (general M): dequantize packed B into a scratch buffer in the activation dtype,
+// then run MPSMatrixMultiplication A[M,K] . B_dq[N,K]^T -> out[M,N], plus an optional bias
+// epilogue -- ALL encoded on ONE command buffer with ONE commit + ONE blocking wait. That
+// single-sync structure is the point: the Phase-M2 finding is that the per-call cross-queue
+// sync (~0.15-0.25ms) dominates wall-clock, so dequant-then-torch-F.linear pays it twice
+// (native dequant wait + torch's own GEMM sync) while this path pays it once.
+//
+// code (float32[16]), B (uint8 packed, N*K/2 bytes), absmax (float32[N*K >> bs_shift]),
+// A (M*K elements of T), bias (N elements of T, may be NULL), out (M*N elements of T).
+// dtype_flag: 0 = fp32, 1 = fp16. bf16 is NOT accepted: MPSMatrixMultiplication asserts on
+// anything but fp32/fp16/int8/int16 (verified on macOS 26.4.1), so the Python router keeps
+// bf16 on the dequant + F.linear fallback.
+extern "C" void bnb_mps_gemm_4bit(
+    void* code, void* B, void* absmax, void* A, void* bias, void* out, int64_t M, int64_t K, int64_t N,
+    int64_t bs_shift, int64_t dtype_flag
+) {
+    @autoreleasepool {
+        const bool fp16 = (dtype_flag == 1);
+        const size_t elsize = fp16 ? 2 : 4;
+        const MPSDataType mps_dtype = fp16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+
+        id<MTLBuffer> scratch = get_scratch((size_t)N * (size_t)K * elsize);
+        id<MTLCommandBuffer> cb = [get_queue() commandBuffer];
+
+        // 1) Dequantize packed B -> scratch B_dq[N, K] in T (one thread per 32-element chunk).
+        {
+            id<MTLComputePipelineState> pso =
+                get_pipeline(fp16 ? @"dequantize_4bit_chunked_fp16" : @"dequantize_4bit_chunked_fp32");
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:(__bridge id<MTLBuffer>)code offset:0 atIndex:0];
+            [enc setBuffer:(__bridge id<MTLBuffer>)B offset:0 atIndex:1];
+            [enc setBuffer:(__bridge id<MTLBuffer>)absmax offset:0 atIndex:2];
+            [enc setBuffer:scratch offset:0 atIndex:3];
+            uint32_t shift32 = (uint32_t)bs_shift;
+            [enc setBytes:&shift32 length:sizeof(shift32) atIndex:4];
+
+            const NSUInteger chunks = (NSUInteger)((N * K) >> 5); // K % 32 == 0 (router guard)
+            NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
+            if (tg > 256) {
+                tg = 256;
+            }
+            if (tg > chunks) {
+                tg = chunks;
+            }
+            if (tg == 0) {
+                tg = 1;
+            }
+            [enc dispatchThreads:MTLSizeMake(chunks, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            [enc endEncoding];
+        }
+
+        // 2) GEMM on the same command buffer. Metal's automatic hazard tracking orders the
+        //    MPS encoder after the dequant encoder (scratch is a tracked resource).
+        {
+            MPSMatrixDescriptor* dA = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)M
+                                                                            columns:(NSUInteger)K
+                                                                           rowBytes:(NSUInteger)K * elsize
+                                                                           dataType:mps_dtype];
+            MPSMatrixDescriptor* dB = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)N
+                                                                            columns:(NSUInteger)K
+                                                                           rowBytes:(NSUInteger)K * elsize
+                                                                           dataType:mps_dtype];
+            MPSMatrixDescriptor* dC = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)M
+                                                                            columns:(NSUInteger)N
+                                                                           rowBytes:(NSUInteger)N * elsize
+                                                                           dataType:mps_dtype];
+            MPSMatrix* mA = [[[MPSMatrix alloc] initWithBuffer:(__bridge id<MTLBuffer>)A descriptor:dA] autorelease];
+            MPSMatrix* mB = [[[MPSMatrix alloc] initWithBuffer:scratch descriptor:dB] autorelease];
+            MPSMatrix* mC = [[[MPSMatrix alloc] initWithBuffer:(__bridge id<MTLBuffer>)out descriptor:dC] autorelease];
+            [get_gemm(M, N, K, dtype_flag) encodeToCommandBuffer:cb leftMatrix:mA rightMatrix:mB resultMatrix:mC];
+        }
+
+        // 3) Optional bias epilogue: out[m, n] += bias[n], still the same command buffer.
+        if (bias) {
+            id<MTLComputePipelineState> pso = get_pipeline(fp16 ? @"gemm_bias_add_fp16" : @"gemm_bias_add_fp32");
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:0];
+            [enc setBuffer:(__bridge id<MTLBuffer>)bias offset:0 atIndex:1];
+            uint32_t N32 = (uint32_t)N;
+            [enc setBytes:&N32 length:sizeof(N32) atIndex:2];
+
+            NSUInteger w = pso.threadExecutionWidth;
+            NSUInteger h = pso.maxTotalThreadsPerThreadgroup / w;
+            if (h > (NSUInteger)M) {
+                h = (NSUInteger)M;
+            }
+            if (h == 0) {
+                h = 1;
+            }
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)N, (NSUInteger)M, 1)
+                threadsPerThreadgroup:MTLSizeMake(w, h, 1)];
+            [enc endEncoding];
+        }
+
+        static const bool profile = getenv("BNB_MPS_PROFILE") != nullptr;
+        const double t_commit = profile ? host_time_s() : 0.0;
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (profile) {
+            const double t_done = host_time_s();
+            const double sched_ms = ([cb GPUStartTime] - t_commit) * 1000.0;
+            const double gpu_ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+            const double done_ms = (t_done - [cb GPUEndTime]) * 1000.0;
+            NSLog(
+                @"bnb_mps_gemm_4bit dtype=%lld M=%lld N=%lld K=%lld bias=%d sched=%.3fms gpu=%.3fms done=%.3fms",
+                (long long)dtype_flag, (long long)M, (long long)N, (long long)K, bias ? 1 : 0, sched_ms, gpu_ms, done_ms
+            );
+        }
     }
 }
 

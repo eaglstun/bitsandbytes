@@ -1,12 +1,15 @@
 # MPS Backend Status — Phase 1 audit + Phase 2 first native kernel
 
-**Date:** 2026-07-08 · **Branch:** `feature/mps-metal-kernels` (base: `777c145`)
+**Date:** 2026-07-08 (Phases 1–3) · 2026-07-14 (Phases M1–M4, 4-bit matmul) ·
+**Branch:** `feature/mps-metal-kernels` (base: `777c145`), then `feature/mps-matmul`
 **Machine:** Apple Silicon (arm64), macOS **26.4.1**
 **Stack:** Python 3.14.2 · torch **2.12.1** · bitsandbytes 0.50.0.dev0
 **Harness:** `tests/test_mps_parity.py` — Phase-1 baseline (no native build): **183 passed, 1 xfailed
 (strict), 0 skipped**. Phase-3 source build (`-DCOMPUTE_BACKEND=mps`, `BNB_MPS_REQUIRE_NATIVE=1`):
 **293 passed, 1 xfailed**, with `quantize_blockwise`, `dequantize_blockwise`, `dequantize_4bit`, and
-`quantize_4bit` all running through hand-written Metal and bit-exact vs the CPU oracle.
+`quantize_4bit` all running through hand-written Metal and bit-exact vs the CPU oracle. Phase-M4
+build: **328 passed** plus the known, unrelated lion strict-xfail XPASS (a separate optimizer track;
+see §5), with the 4-bit matmuls native per §11.
 
 This is the Phase-1 deliverable (§3 audit) plus the Phase-2 result (first native kernel end to end).
 Re-verify against `bitsandbytes/_ops.py` and `bitsandbytes/backends/mps/ops.py` before trusting this
@@ -57,24 +60,24 @@ Three tiers, checked in order by the torch dispatcher:
 
 Parity = max deviation vs the CPU oracle with seeded inputs (see §3 for tolerances).
 
-| Op (`bitsandbytes::…`)            | `mps` reg?                       | Path that runs here                  | Parity vs CPU oracle                               |
-| --------------------------------- | -------------------------------- | ------------------------------------ | -------------------------------------------------- |
-| `quantize_blockwise`              | ✅ **native Metal** (P2)         | hand-written kernel (fallback avail) | codes **bit-exact**, absmax **bit-exact**          |
-| `dequantize_blockwise`            | ✅ **native Metal** (P3)         | hand-written kernel (fallback avail) | **bit-exact** all dtypes/blocksizes                |
-| `dequantize_blockwise.out`        | ❌ (cuda/xpu only, no default)   | **`NotImplementedError`**            | — (gap)                                            |
-| `quantize_4bit`                   | ✅ **native Metal** (P3)         | hand-written kernel (fallback avail) | packed nibbles **bit-exact**, absmax **bit-exact** |
-| `dequantize_4bit` (+`.out`)       | ✅ **native Metal** (P3)         | hand-written kernel (fallback avail) | **bit-exact** all dtypes/blocksizes                |
-| `gemv_4bit` (+`.out`)             | ✅ (dequant native + `F.linear`) | native dequant + `F.linear` on MPS   | fp32 ≤ 7.7e-6; fp16/bf16 0.0 at tested sizes       |
-| `gemm_4bit`                       | ✅ (Hub M==1 → dequant+linear)   | dequant + `F.linear` on MPS          | fp32 ≤ 3.9e-6; fp16/bf16 0.0 (incl. nested absmax) |
-| `int8_linear_matmul` (+`.out`)    | ❌ → `default`                   | fp32 matmul on MPS                   | exact (int32)                                      |
-| `int8_vectorwise_quant`           | ❌ → `default`                   | pure-torch on MPS                    | exact (incl. outlier extraction, threshold=6)      |
-| `int8_vectorwise_dequant`         | ❌ → `default`                   | pure-torch on MPS                    | exact                                              |
-| `int8_mm_dequant`                 | ❌ → `default`                   | pure-torch on MPS                    | exact                                              |
-| `int8_scaled_mm`                  | ❌ → `default`                   | composition of the above             | exact                                              |
-| `int8_mixed_scaled_mm`            | ❌ → `default`                   | composition of the above             | covered via components                             |
-| `int8_double_quant`               | ❌ (cuda only, no default)       | **`NotImplementedError`**            | — (gap; also unavailable on cpu)                   |
-| `optimizer_update_32bit`          | ❌ → `default`                   | pure-torch on MPS                    | exact, **except lion + weight_decay (§5)**         |
-| `optimizer_update_8bit_blockwise` | ❌ (cpu/cuda/xpu, no default)    | **`NotImplementedError`**            | — (gap: 8-bit optimizers unusable on mps)          |
+| Op (`bitsandbytes::…`)            | `mps` reg?                     | Path that runs here                  | Parity vs CPU oracle                               |
+| --------------------------------- | ------------------------------ | ------------------------------------ | -------------------------------------------------- |
+| `quantize_blockwise`              | ✅ **native Metal** (P2)       | hand-written kernel (fallback avail) | codes **bit-exact**, absmax **bit-exact**          |
+| `dequantize_blockwise`            | ✅ **native Metal** (P3)       | hand-written kernel (fallback avail) | **bit-exact** all dtypes/blocksizes                |
+| `dequantize_blockwise.out`        | ❌ (cuda/xpu only, no default) | **`NotImplementedError`**            | — (gap)                                            |
+| `quantize_4bit`                   | ✅ **native Metal** (P3)       | hand-written kernel (fallback avail) | packed nibbles **bit-exact**, absmax **bit-exact** |
+| `dequantize_4bit` (+`.out`)       | ✅ **native Metal** (P3)       | hand-written kernel (fallback avail) | **bit-exact** all dtypes/blocksizes                |
+| `gemv_4bit` (+`.out`)             | ✅ **native Metal** (M2)       | fused dequant+dot kernel (§11.1)     | within per-dtype tolerances (§3); fallback avail   |
+| `gemm_4bit`                       | ✅ **native Metal** (M3)       | dequant→scratch + MPSMatMul (§11.2)  | within per-dtype tolerances; **bf16 → fallback**   |
+| `int8_linear_matmul` (+`.out`)    | ❌ → `default`                 | fp32 matmul on MPS                   | exact (int32)                                      |
+| `int8_vectorwise_quant`           | ❌ → `default`                 | pure-torch on MPS                    | exact (incl. outlier extraction, threshold=6)      |
+| `int8_vectorwise_dequant`         | ❌ → `default`                 | pure-torch on MPS                    | exact                                              |
+| `int8_mm_dequant`                 | ❌ → `default`                 | pure-torch on MPS                    | exact                                              |
+| `int8_scaled_mm`                  | ❌ → `default`                 | composition of the above             | exact                                              |
+| `int8_mixed_scaled_mm`            | ❌ → `default`                 | composition of the above             | covered via components                             |
+| `int8_double_quant`               | ❌ (cuda only, no default)     | **`NotImplementedError`**            | — (gap; also unavailable on cpu)                   |
+| `optimizer_update_32bit`          | ❌ → `default`                 | pure-torch on MPS                    | exact, **except lion + weight_decay (§5)**         |
+| `optimizer_update_8bit_blockwise` | ❌ (cpu/cuda/xpu, no default)  | **`NotImplementedError`**            | — (gap: 8-bit optimizers unusable on mps)          |
 
 **Round-trip reconstruction** (quantize→dequantize on MPS vs same on CPU, seeded randn,
 blocksize ∈ {64, 128, 256, 512}, dtypes fp32/fp16/bf16):
@@ -367,3 +370,185 @@ the _installed_ package. Confirmed against the installed wheel:
 **Still open (not this task):** the wheel is a plain-tagged platform wheel; CI matrix / release
 automation to actually publish MPS wheels is a separate concern. The per-call offset-0 input copy and
 the fused 4-bit matmuls remain as documented above.
+
+---
+
+## 10. Phase M1 — 4-bit matmul baseline + A/B decision (spike)
+
+**Status: measured. Decision made.** This is the `NEXT_MATMUL_PLAN.md` Phase M1 spike, but done
+against the _real_ baseline (today's `dequant → F.linear`) rather than an unbuilt native route — the
+numbers decide the design fork on their own, so no throwaway MPSMatMul wiring was needed to choose.
+
+**Method.** `torch.mps.synchronize()`-bracketed timing, warmup + 30–50 iters, native dequant forced
+(`BNB_MPS_REQUIRE_NATIVE=1`), nf4/blocksize-64. Per shape we isolate the two costs inside today's
+unfused path: the native Metal **dequant of B** (materializes full `B_dq`) and the **`F.linear`** GEMM
+on that materialized `B_dq`. Bench scripts: `scratchpad/bench_matmul_baseline.py`,
+`bench_gemm_baseline.py` (not committed; reproduce from the numbers here).
+
+**gemv (M=1), fp16/bf16** — dequant is the whole cost:
+
+| N     | K     | total  | dequant | linear | dequant share |
+| ----- | ----- | ------ | ------- | ------ | ------------- |
+| 4096  | 4096  | 0.94ms | 0.75ms  | 0.07ms | ~80%          |
+| 11008 | 4096  | 1.80ms | ~2.0ms  | 0.19ms | ~90%+         |
+| 4096  | 11008 | 1.81ms | 1.63ms  | 0.21ms | ~90%          |
+
+**gemm (N=K=4096, fp16), sweeping M** — fixed dequant floor, GEMM overtakes it near M≈512:
+
+| M    | total  | dequant | linear | GEMM share |
+| ---- | ------ | ------- | ------ | ---------- |
+| 8    | 1.41ms | 0.80ms  | 0.10ms | 7%         |
+| 64   | 1.21ms | 0.88ms  | 0.42ms | 35%        |
+| 512  | 2.50ms | 0.73ms  | 1.27ms | 51%        |
+| 2048 | 5.66ms | 0.76ms  | 4.85ms | 86%        |
+
+**Decision (per-op, as the plan anticipated — now with evidence):**
+
+- **`gemv_4bit` (M=1) → Option B (hand-fused dequant+matmul).** 80–90% dequant-bound; Option A
+  (`MPSMatrixMultiplication` on materialized `B_dq`) would only touch the ~10% GEMM slice. Fusion —
+  never writing `B_dq` to device memory — is the entire win. This is Phase M2.
+- **`gemm_4bit` large M (≥~512) → Option A (`MPSMatrixMultiplication`).** GEMM dominates; do not try to
+  out-GEMM Apple's tuned kernel by hand. Accept the fixed ~0.75ms dequant tax. This is Phase M3.
+- Small-M `gemm` (≤64) is still dequant-bound and behaves like gemv; a fused path helps there too, but
+  M3 defaults to Option A for simplicity and lets the fixed dequant floor stand.
+
+The Phase M2 (fused gemv), M3 (native gemm), and M4 (sync/offset closeout) results are consolidated
+in **§11** below.
+
+**Load-bearing caveat for the kernel author.** The existing dequant kernel moves ~40 MB in ~0.75ms ≈
+**54 GB/s**, on hardware that sustains ~400 GB/s — it's leaving ~85% of memory bandwidth on the floor.
+Both matmul routes inherit this: a fused `gemv` kernel that reads packed B no faster than the current
+dequant will reproduce the 54 GB/s and win ~nothing. **The M2 target is bandwidth, not "fusion" per se**
+— the fused kernel must read packed B + absmax at close to peak bandwidth (coalesced loads, minimal
+recompute) or it doesn't beat the baseline. (Separately, this implies the standalone dequant kernel is
+itself under-optimized — a possible bigger, simpler lever for the QLoRA M=1 inference case — but that's
+Phase-3 kernel scope, out of this phase's remit.)
+
+---
+
+## 11. Phases M2–M4 — native 4-bit matmul (fused gemv + MPSMatMul gemm) and the sync/offset closeout
+
+**Status: complete and green.** Both 4-bit matmuls run natively per the §10 decision. Phase-M4 full
+suite: **328 passed** under `BNB_MPS_REQUIRE_NATIVE=1` (plus the known, unrelated lion strict-xfail
+XPASS, §5). Wall-clock numbers below are steady-state (warmed, back-to-back calls) on this machine;
+DVFS makes idle-gapped calls slower.
+
+### 11.1 Phase M2 — `gemv_4bit` (M == 1): hand-fused Metal kernel (Option B)
+
+`gemv_4bit_fp32/fp16/bf16` in `csrc/mps_kernels.metal`: one SIMD-group per output element, uint4
+loads of packed B, in-register nf4/fp4 dequant (weights rounded to the activation dtype, matching
+the oracle's `B_dq.to(dtype)`), fp32 fma accumulation with split accumulators, `simd_sum`
+reduction. **B_dq is never materialized.** Router guards: true M==1, K % 32 == 0, power-of-two
+blocksize ≥ 32, 16-entry code, packed-size check; anything else falls back to dequant+`F.linear`.
+
+- Parity: all gemv tests green under `BNB_MPS_REQUIRE_NATIVE=1`, native asserted via spy; K%32≠0
+  and native-absent fallbacks asserted.
+- Wall-clock vs the dequant+`F.linear` baseline (nf4/bs64, 50 iters): **3.4–6.2x** across
+  fp16/bf16/fp32 on the §10 shapes (e.g. fp16 4096×4096: 0.31ms vs 1.64ms; 11008×4096: 0.51ms vs
+  1.76ms). Kernel-only GPU time ~0.11–0.14ms for the ~25 MB shapes when clocked up ≈ **~230 GB/s**
+  effective read (vs the standalone dequant kernel's ~54 GB/s). Bench:
+  `benchmarks_wip/bench_gemv_fused.py`.
+
+### 11.2 Phase M3 — `gemm_4bit` (general M): chunked dequant + `MPSMatrixMultiplication` (Option A)
+
+`bnb_mps_gemm_4bit` in `csrc/mps_ops.mm` encodes, on **one command buffer / one commit / one
+blocking wait**: (1) a chunked dequant kernel (`dequantize_4bit_chunked_fp32/fp16`, one thread per
+32-element uint4 chunk) writing `(T)(code[nib]*absmax)` into a growable **private scratch
+`MTLBuffer`** — same rounding as the oracle's `B_dq.to(dtype)`; (2) a shape-cached
+`MPSMatrixMultiplication` `A[M,K]·B_dq[N,K]ᵀ` (row-major, `transposeRight=YES`); (3) an optional
+`out[m,n] += bias[n]` epilogue kernel. The single sync is the structural win over
+dequant+`F.linear`, which pays the cross-queue round trip twice.
+
+- **bf16 is excluded by the router:** `MPSMatrixMultiplication` hard-asserts on anything but
+  fp32/fp16/int8/int16 (probed on macOS 26.4.1: "Input data type must be one of
+  MPSDataTypeFloat32, MPSDataTypeFloat16, MPSDataTypeInt8, or MPSDataTypeInt16"), so bf16 keeps
+  the dequant+`F.linear` fallback verbatim (still parity-green, asserted by
+  `test_gemm_4bit_bf16_uses_fallback`).
+- Other router guards mirror gemv: K % 32 == 0, power-of-two blocksize ≥ 32, packed-size and bias
+  checks; nested absmax is unpacked to plain fp32 absmax before routing, unchanged.
+- Parity: native asserted via spy incl. ±bias/±nested-absmax; fp32-vs-MPSMatMul accumulation stays
+  within the documented 1e-5 atol at the calibrated K ≤ 256. (The one tolerance trip found during
+  M3 was in the **pure-torch** fallback composition at K=256/M=4, so the graceful-fallback test
+  pins K=64.)
+- Wall-clock vs the dequant+`F.linear` fallback (nf4/bs64, N=K=4096, 30 iters): fp16 **2.5x**
+  (M=8), **1.5x** (M=64, M=512), **1.08x** (M=2048); fp32 **1.6x/1.5x** (M=8/64), **1.1x** (M=512),
+  **~1.0x** (M=2048). The win is the single sync + a much faster chunked dequant at small/medium M;
+  ~flat at M=2048 where the GEMM itself dominates and MPSMatMul ≈ `F.linear`'s GEMM. Bench:
+  `benchmarks_wip/bench_gemm_baseline.py`.
+
+### 11.3 Phase M4 — the per-call sync tax: measured, decomposed, and why it stays
+
+Every native op runs on a **private** `MTLCommandQueue` and pays: `torch.mps.synchronize()` before
+dispatch (torch's pending writes to the inputs must be materialized) and `waitUntilCompleted` after
+commit (outputs complete before torch reads them). `BNB_MPS_PROFILE=1` now decomposes each call
+(`sched` = commit → GPU start, `gpu` = kernel execution, `done` = GPU end → wait return; timebase
+`mach_absolute_time`, same clock as `GPUStartTime`). Steady-state, fp16, idle torch queue:
+
+| call               | total wall | pre-sync | encode  | sched   | gpu     | done    | fixed tax (non-gpu) |
+| ------------------ | ---------- | -------- | ------- | ------- | ------- | ------- | ------------------- |
+| gemv 4096×4096     | 0.29ms     | ~1µs     | ~0.02ms | ~0.07ms | 0.137ms | ~0.07ms | **~0.15ms (~52%)**  |
+| gemv 11008×4096    | 0.50ms     | ~1µs     | ~0.02ms | ~0.10ms | 0.339ms | ~0.06ms | ~0.16ms (~32%)      |
+| gemm M=8 (4096²)   | 0.59ms     | ~1µs     | ~0.02ms | ~0.06ms | ~0.39ms | ~0.07ms | ~0.17ms (~30%)      |
+| gemm M=512 (4096²) | 1.55ms     | ~2µs     | ~0.02ms | ~0.07ms | 1.30ms  | ~0.07ms | ~0.16ms (~10%)      |
+
+Two distinct costs:
+
+1. **The fixed ~0.15ms/call round trip** (encode + commit→GPU-start scheduling + completion
+   delivery). This is inherent to one-command-buffer-per-call on a private queue, NOT to the
+   `torch.mps.synchronize()` itself — which is ~1µs when torch's queue is idle.
+2. **Lost overlap when torch's queue is busy:** the pre-sync blocks until torch's pending work
+   drains (measured 1.3ms with a pending 4096² fp16 matmul). That work would run anyway; the cost
+   is serialization — the CPU stalls instead of encoding ahead.
+
+**Why the private queue + both syncs stay (the Task-1 investigation, torch 2.12.1):**
+
+- **torch exposes no queue/stream handle.** Nothing in `torch.mps` / `torch._C._mps_*` returns the
+  `MTLCommandQueue` or `MPSStream` (only events, shader compilation, and synchronize exist; there
+  is no `torch.mps.current_stream()` in 2.12.1).
+- **The C++ internals are reachable only as an ABI trap.** `libtorch_cpu.dylib` exports
+  `at::mps::getCurrentMPSStream()` and some `MPSStream` methods, but: `commandQueue()`/`queue()`
+  are inline (recovering them means reading ivars at header-derived offsets — layout-dependent);
+  `commit()`/`flush()` are private; every encode must run on torch's private `_serialQueue`
+  dispatch queue to avoid racing its kernel-coalescing encoder; and `SyncType` enum values would
+  be assumed. dlsym-ing mangled C++ internals from a torch-independent ctypes dylib is exactly the
+  miscast class of bug the load-time buffer-contract guard exists to prevent. Rejected.
+- **Sharing only the queue would not remove the pre-sync anyway.** Command buffers execute in
+  COMMIT order, and torch batches encodes into an uncommitted `MPSCommandBuffer` — a buffer we
+  commit first can run before torch's earlier-issued-but-uncommitted writes. Correct ordering
+  still requires torch to flush, which is also not exposed.
+- **Future directions (recorded, not taken):** (a) build the mps backend as a libtorch-linked
+  torch extension using `getCurrentMPSStream()` — the sanctioned C++ route, but it couples the
+  binary to the torch ABI/version, contrary to bnb's ship-one-binary packaging; (b)
+  `torch.mps.compile_shader` (documented since ~torch 2.7) dispatches user MSL on torch's own
+  stream and would eliminate both syncs for the pure-MSL kernels — but it is runtime source
+  compilation (the `-fno-fast-math` metallib guarantees would need re-validation) and cannot host
+  the `MPSMatrixMultiplication` gemm. Either is a re-architecture, out of M4 scope.
+
+**Guard:** `test_sync_discipline_interleave_stress` interleaves dependent torch writes with native
+matmuls on the same buffers, parity-checked every iteration. Verified to have teeth: with
+`torch.mps.synchronize` no-op'd it fails **30/30** iterations; with the discipline intact it passes
+100%. Any future change to the sync must keep this test green.
+
+### 11.4 Phase M4 — offset-0 input copy: pointer semantics verified, clone stays
+
+`_ensure_native_buffer` `.clone()`s any input with `storage_offset != 0`. §5 of
+`NEXT_MATMUL_PLAN.md` asked whether that copy can be replaced by binding at a byte offset.
+Verified on this build (torch 2.12.1):
+
+- **A view's `data_ptr()` is `base_ptr + storage_offset * itemsize`** — raw pointer arithmetic
+  (probed: a fp32 view at offset 128 reads exactly +512 bytes). It is NOT an `id<MTLBuffer>`;
+  even objc-probing such an interior pointer (protocol conformance inside `@try/@catch`)
+  **SIGSEGVs the process** — the crash is not catchable. The clone is load-bearing; casting a
+  view's `data_ptr()` would be silent-corruption-or-crash.
+- **New finding (better than §5 feared):** the base buffer object IS recoverable from Python —
+  `t.untyped_storage().data_ptr()` returns the base allocation pointer, which passes the
+  buffer-contract check as a genuine `id<MTLBuffer>` of the full allocation size. So safe offset
+  binding is _possible_: bind `untyped_storage().data_ptr()` with
+  `[enc setBuffer:base offset:storage_offset*itemsize atIndex:i]` (plus alignment guards for the
+  kernels' vectorized uint4 loads).
+- **Decision: not implemented.** Steady-state matmul inputs (activations, quant state) are fresh
+  offset-0 allocations — the clone almost never fires in the QLoRA path — and the change would
+  touch every C ABI entry point for no measured benefit. The recipe above is recorded for when a
+  workload actually hits the copy. `test_view_data_ptr_is_base_plus_offset` pins the verified
+  semantics so a future torch that changes them fails loudly instead of silently invalidating
+  `_ensure_native_buffer`'s premise.

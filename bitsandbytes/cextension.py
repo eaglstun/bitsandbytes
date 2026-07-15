@@ -181,6 +181,38 @@ class MpsBNBNativeLibrary(BNBNativeLibrary):
             ct.c_int64,  # blocksize
         ]
 
+        # Older native builds predate the fused matmul kernels; guard so a stale dylib
+        # keeps the quant/dequant native path without breaking library load.
+        if hasattr(lib, "bnb_mps_gemv_4bit"):
+            lib.bnb_mps_gemv_4bit.restype = None
+            lib.bnb_mps_gemv_4bit.argtypes = [
+                ct.c_void_p,  # code (float32[16])
+                ct.c_void_p,  # B (uint8 packed, N*K/2 bytes)
+                ct.c_void_p,  # absmax (float32[blocks])
+                ct.c_void_p,  # A (activation dtype [K])
+                ct.c_void_p,  # out (activation dtype [N])
+                ct.c_int64,  # K
+                ct.c_int64,  # N
+                ct.c_int64,  # bs_shift = log2(blocksize)
+                ct.c_int64,  # dtype_flag (0=fp32, 1=fp16, 2=bf16)
+            ]
+
+        if hasattr(lib, "bnb_mps_gemm_4bit"):
+            lib.bnb_mps_gemm_4bit.restype = None
+            lib.bnb_mps_gemm_4bit.argtypes = [
+                ct.c_void_p,  # code (float32[16])
+                ct.c_void_p,  # B (uint8 packed, N*K/2 bytes)
+                ct.c_void_p,  # absmax (float32[blocks])
+                ct.c_void_p,  # A (activation dtype [M*K])
+                ct.c_void_p,  # bias (activation dtype [N]; None when absent)
+                ct.c_void_p,  # out (activation dtype [M*N])
+                ct.c_int64,  # M
+                ct.c_int64,  # K
+                ct.c_int64,  # N
+                ct.c_int64,  # bs_shift = log2(blocksize)
+                ct.c_int64,  # dtype_flag (0=fp32, 1=fp16; MPSMatrixMultiplication has no bf16)
+            ]
+
     def verify_buffer_contract(self) -> None:
         """Verify the undocumented torch contract that an MPS tensor's data_ptr() is its
         id<MTLBuffer>. Raises RuntimeError if a future torch has broken it, so callers can
