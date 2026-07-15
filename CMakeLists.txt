@@ -3,7 +3,7 @@
 #   For  GCC: `cmake -B build . && cmake --build build`
 #   For MSVC: `cmake -B build . && cmake --build build --config Release`
 # You can also use the following options and variables
-#  - COMPUTE_BACKEND: Set to `cpu`, `cuda`, or `mps` to select the backend
+#  - COMPUTE_BACKEND: Set to `cpu`, `cuda`, `hip`, or `xpu` to select the backend
 #  - CUDA_VERSION: The expected CUDA version, for sanity checking. The actual version
 #                  is whatever CMake finds on your path.
 #  - COMPUTE_CAPABILITY: Which GPU Arch/Compute codes to provide to NVCC.
@@ -62,14 +62,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Define included source files
 set(CPP_FILES csrc/cpu_ops.cpp csrc/pythonInterface.cpp)
 set(GPU_FILES csrc/ops.cu csrc/kernels.cu)
+set(XPU_FILES csrc/xpu_ops.cpp csrc/xpu_kernels.cpp)
 set(MPS_FILES csrc/mps_ops.mm)
 set(METAL_FILES csrc/mps_kernels.metal)
-set(XPU_FILES csrc/xpu_ops.cpp csrc/xpu_kernels.cpp)
 # C++ sources are always included
 list(APPEND SRC_FILES ${CPP_FILES})
 
-set(COMPUTE_BACKEND "cpu" CACHE STRING "The compute backend to use (cpu, cuda, hip, mps, xpu)")
-set_property(CACHE COMPUTE_BACKEND PROPERTY STRINGS cpu cuda hip mps xpu)
+set(COMPUTE_BACKEND "cpu" CACHE STRING "The compute backend to use (cpu, cuda, hip, xpu, mps)")
+set_property(CACHE COMPUTE_BACKEND PROPERTY STRINGS cpu cuda hip xpu mps)
 option(PTXAS_VERBOSE "Pass through -v flag to PTX Assembler" OFF)
 
 if(APPLE)
@@ -86,34 +86,32 @@ if(${COMPUTE_BACKEND} STREQUAL "cuda")
     endif()
     set(BUILD_CUDA ON)
     set(BUILD_HIP OFF)
-    set(BUILD_MPS OFF)
 elseif(${COMPUTE_BACKEND} STREQUAL "hip")
     if(APPLE)
         message(FATAL_ERROR "HIP is not supported on macOS" )
     endif()
     set(BUILD_CUDA OFF)
     set(BUILD_HIP ON)
-    set(BUILD_MPS OFF)
-elseif(${COMPUTE_BACKEND} STREQUAL "mps")
-    if(NOT APPLE)
-        message(FATAL_ERROR "MPS is only supported on macOS" )
-    endif()
-    set(BUILD_CUDA OFF)
-    set(BUILD_HIP OFF)
-    set(BUILD_MPS ON)
 elseif(${COMPUTE_BACKEND} STREQUAL "xpu")
     if(APPLE)
         message(FATAL_ERROR "XPU is not supported on macOS" )
     endif()
     set(BUILD_CUDA OFF)
     set(BUILD_HIP OFF)
-    set(BUILD_MPS OFF)
     set(BUILD_XPU ON)
+elseif(${COMPUTE_BACKEND} STREQUAL "mps")
+    if(NOT APPLE)
+        message(FATAL_ERROR "MPS is only supported on macOS" )
+    endif()
+    set(BUILD_CUDA OFF)
+    set(BUILD_HIP OFF)
+    set(BUILD_XPU OFF)
+    set(BUILD_MPS ON)
 else()
     set(BUILD_CUDA OFF)
     set(BUILD_HIP OFF)
-    set(BUILD_MPS OFF)
     set(BUILD_XPU OFF)
+    set(BUILD_MPS OFF)
     set(BUILD_CPU ON)
 endif()
 
