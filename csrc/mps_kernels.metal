@@ -128,6 +128,112 @@ kernel void dequantize_4bit(
     }
 }
 
+// ---- Fused 4-bit gemv (NF4/FP4): out[n] = sum_k A[k] * dequant(B[n,k]) ----
+// One threadgroup = one SIMD-group (32 threads) per output element n. Threads stride over
+// the packed row in uint4 units (16 bytes = 32 elements), dequantize in registers, and
+// accumulate the dot product in fp32; a simd_sum reduction produces out[n]. Packed B is
+// never materialized as a dequantized tensor -- this is the Phase M2 bandwidth win over
+// dequant + F.linear.
+//
+// Preconditions enforced by the Python router (fallback used otherwise):
+//   - K % 32 == 0, so every packed row (K/2 bytes) is 16-byte aligned and uint4 loads are
+//     valid for every n.
+//   - blocksize is a power of two (>= 32); `bs_shift` = log2(blocksize). Because K % 32 == 0
+//     and blocksize is a multiple of 32, a 32-element chunk never straddles an absmax block,
+//     so absmax is loaded once per chunk.
+//
+// Numeric parity with the CPU oracle (dequantize to A.dtype, then F.linear): the dequantized
+// weight code[nib] * absmax is computed in fp32 and then ROUNDED to the activation dtype T
+// before the multiply, reproducing the reference's `.to(dtype)` on B_dq. A is read in its
+// native dtype (upcast to fp32 is exact) and accumulation is fp32; only accumulation ORDER
+// differs from the oracle, which is what the documented per-dtype tolerances absorb. The
+// final sum is rounded to T on store, matching F.linear's output dtype.
+//
+// One kernel per activation dtype (fp32/fp16/bf16) so A and out bind in torch's own dtype:
+// the Python wrapper then launches ZERO torch cast kernels per call.
+template <typename T>
+static inline void gemv_4bit_body(
+    device const float* code,
+    device const uchar* B,
+    device const float* absmax,
+    device const T* A,
+    device T* out,
+    uint K,
+    uint bs_shift,
+    uint n,
+    uint lane) {
+    const ulong row_base = (ulong)n * (ulong)K;  // flattened element index of B[n, 0]
+    device const uint4* Brow = (device const uint4*)(B + (row_base >> 1));
+    const uint chunks = K >> 5;  // 32 elements (16 packed bytes) per chunk
+
+    // Four independent accumulators (one per uint word of the chunk) break the serial fma
+    // dependency chain; the kernel is ALU/latency-bound, not memory-bound, so this matters.
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    for (uint c = lane; c < chunks; c += 32u) {
+        const uint4 packed = Brow[c];
+        const uint k0 = c << 5;
+        // The whole chunk lives in one absmax block (see preconditions above).
+        const float am = absmax[(row_base + k0) >> bs_shift];
+
+#pragma unroll
+        for (uint w = 0; w < 4; ++w) {
+            const uint word = packed[w];
+            const uint kw = k0 + (w << 3);
+            float acc_hi = 0.0f;
+            float acc_lo = 0.0f;
+            // Little-endian: byte b of `word` is packed byte index (kw/2 + b), holding
+            // elements kw + 2b (high nibble) and kw + 2b + 1 (low nibble).
+#pragma unroll
+            for (uint b = 0; b < 4; ++b) {
+                const uint byte = (word >> (b << 3)) & 0xFFu;
+                const uint k = kw + (b << 1);
+                const float w_hi = (float)(T)(code[byte >> 4] * am);
+                const float w_lo = (float)(T)(code[byte & 0x0Fu] * am);
+                // Explicit fma: -fno-fast-math disables contraction, but a deliberate fused
+                // multiply-add is both allowed and more accurate than mul-then-add.
+                acc_hi = fma((float)A[k], w_hi, acc_hi);
+                acc_lo = fma((float)A[k + 1], w_lo, acc_lo);
+            }
+            const float word_sum = acc_hi + acc_lo;
+            if (w == 0) {
+                acc0 += word_sum;
+            } else if (w == 1) {
+                acc1 += word_sum;
+            } else if (w == 2) {
+                acc2 += word_sum;
+            } else {
+                acc3 += word_sum;
+            }
+        }
+    }
+
+    const float total = simd_sum((acc0 + acc1) + (acc2 + acc3));
+    if (lane == 0) {
+        out[n] = (T)total;
+    }
+}
+
+#define BNB_GEMV_4BIT_KERNEL(NAME, T)                                                                                \
+    kernel void NAME(                                                                                                \
+        device const float* code [[buffer(0)]],    /* 16-entry 4-bit code (NF4 or FP4) */                           \
+        device const uchar* B [[buffer(1)]],       /* packed nibbles, N*K/2 bytes, row-major [N, K] */              \
+        device const float* absmax [[buffer(2)]],  /* per-block scales over the flattened [N*K] index */            \
+        device const T* A [[buffer(3)]],           /* activations, K elements of T */                               \
+        device T* out [[buffer(4)]],               /* N elements of T */                                            \
+        constant uint& K [[buffer(5)]],                                                                              \
+        constant uint& bs_shift [[buffer(6)]], /* log2(blocksize) */                                                 \
+        uint n [[threadgroup_position_in_grid]],                                                                     \
+        uint lane [[thread_index_in_simdgroup]]) {                                                                   \
+        gemv_4bit_body<T>(code, B, absmax, A, out, K, bs_shift, n, lane);                                            \
+    }
+
+BNB_GEMV_4BIT_KERNEL(gemv_4bit_fp32, float)
+BNB_GEMV_4BIT_KERNEL(gemv_4bit_fp16, half)
+BNB_GEMV_4BIT_KERNEL(gemv_4bit_bf16, bfloat)
+
 // ---- 4-bit blockwise quantize (NF4/FP4): A (float32) -> packed out + absmax ----
 // `bounds` are the 15 midpoints of the SORTED 16-entry code; `order` maps the searchsorted
 // index back to the stored 4-bit index (identity for NF4, the argsort remap for FP4).

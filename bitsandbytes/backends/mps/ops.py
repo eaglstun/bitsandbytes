@@ -365,6 +365,52 @@ def _(
     out.copy_(result)
 
 
+def _gemv_4bit_native(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    shapeB: Sequence[int],
+    absmax: torch.Tensor,
+    code: torch.Tensor,
+    blocksize: int,
+) -> torch.Tensor:
+    """Route gemv_4bit (M == 1) through the fused hand-written Metal kernel.
+
+    The kernel reads packed 4-bit B + per-block absmax + the 16-entry code table and
+    computes out[n] = sum_k A[k] * dequant(B[n, k]) directly -- the dequantized B is never
+    materialized. Dequantized weights are rounded to A's dtype in-kernel (reproducing the
+    reference's B_dq.to(dtype)); accumulation is fp32, so only accumulation order differs
+    from the oracle. A and out bind in A's own dtype (per-dtype kernel variants), so the
+    steady-state call launches no torch cast kernels. Preconditions (checked by the
+    caller): K % 32 == 0 and power-of-two blocksize.
+    """
+    N, K = int(shapeB[0]), int(shapeB[-1])
+
+    B_flat = B if B.dtype == torch.uint8 else B.view(torch.uint8)
+    B_flat = _ensure_native_buffer(B_flat.reshape(-1))
+    A_flat = _ensure_native_buffer(A.reshape(-1))
+    code_f = _ensure_native_buffer(code.to(torch.float32))
+    absmax_f = _ensure_native_buffer(absmax.to(torch.float32))
+
+    out = torch.empty(N, dtype=A.dtype, device=A.device)
+    dtype_flag = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}[A.dtype]
+    bs_shift = blocksize.bit_length() - 1
+
+    torch.mps.synchronize()
+    _mps_native.bnb_mps_gemv_4bit(
+        code_f.data_ptr(),
+        B_flat.data_ptr(),
+        absmax_f.data_ptr(),
+        A_flat.data_ptr(),
+        out.data_ptr(),
+        K,
+        N,
+        bs_shift,
+        dtype_flag,
+    )
+
+    return out.reshape(*A.shape[:-1], N)
+
+
 def _gemv_4bit_impl(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -373,6 +419,24 @@ def _gemv_4bit_impl(
     code: torch.Tensor,
     blocksize: int,
 ) -> torch.Tensor:
+    # Fused native Metal kernel when available. Guards: true gemv (M == 1), 2-D shapeB
+    # matching A's K, K % 32 == 0 (uint4 row loads need 16-byte-aligned rows), power-of-two
+    # blocksize (the kernel indexes absmax with a shift), and a plain 16-entry code table
+    # whose packed B has the expected size.
+    if (
+        _native_available()
+        and hasattr(_mps_native._lib, "bnb_mps_gemv_4bit")  # stale dylibs predate the fused kernel
+        and A.numel() == A.shape[-1]
+        and len(shapeB) == 2
+        and shapeB[-1] == A.shape[-1]
+        and shapeB[-1] % 32 == 0
+        and blocksize >= 32
+        and (blocksize & (blocksize - 1)) == 0
+        and code.numel() == 16
+        and B.numel() * B.element_size() == (shapeB[0] * shapeB[1]) // 2
+    ):
+        return _gemv_4bit_native(A, B, shapeB, absmax, code, blocksize)
+
     if blocksize in (64, 128, 256) and (k := _get_kernel()) is not None:
         if B.dtype != torch.uint8:
             B = B.view(torch.uint8)

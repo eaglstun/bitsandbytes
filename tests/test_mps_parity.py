@@ -293,9 +293,75 @@ class TestNativeMetalPath:
         dq_mps = torch.ops.bitsandbytes.dequantize_4bit(q_mps, am_mps, blocksize, quant_type, shape, torch.float32)
         assert torch.equal(dq_mps.cpu(), dq_cpu)
 
+    # ---- Phase M2: fused gemv_4bit (dequant + dot product in one Metal kernel) ----
+
+    @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
+    @pytest.mark.parametrize("quant_type", ["nf4", "fp4"])
+    @pytest.mark.parametrize("blocksize", [64, 256])
+    def test_gemv_4bit_native_fused(self, dtype, quant_type, blocksize, monkeypatch):
+        """gemv_4bit routes through the fused native Metal kernel (asserted via a spy, not
+        assumed) and matches the CPU oracle within the documented per-dtype tolerances."""
+        _require_native()
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        calls = []
+        orig = _mps_ops._gemv_4bit_native
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return orig(*args, **kwargs)
+
+        monkeypatch.setattr(_mps_ops, "_gemv_4bit_native", spy)
+
+        torch.manual_seed(1337)
+        # K=256 matches the size the fp32 tolerance was calibrated at (accumulation-order
+        # deviation vs the CPU oracle grows with K; at K=512 a single fp32 element lands at
+        # ~1.2e-5, just past the 1e-5 atol -- order noise, not a dequant bug).
+        out_features, in_features = 1024, 256
+        A = torch.randn(1, 1, in_features, dtype=dtype)
+        B = torch.randn(out_features, in_features, dtype=dtype)
+        B_q, absmax = torch.ops.bitsandbytes.quantize_4bit(B, blocksize, quant_type, torch.uint8)
+        code = F.get_4bit_type(quant_type, device="cpu", blocksize=blocksize)
+
+        out_cpu = torch.ops.bitsandbytes.gemv_4bit(A, B_q, B.shape, absmax, code, blocksize)
+        out_mps = torch.ops.bitsandbytes.gemv_4bit(
+            A.to("mps"), B_q.to("mps"), B.shape, absmax.to("mps"), code.to("mps"), blocksize
+        )
+
+        assert calls, "gemv_4bit did not route through the fused native Metal kernel"
+        assert out_mps.shape == (1, 1, out_features)
+        assert out_mps.dtype == dtype
+        assert_parity(out_mps, out_cpu, dtype)
+
+    def test_gemv_4bit_unaligned_k_uses_fallback(self, monkeypatch):
+        """K % 32 != 0 cannot take the fused kernel (uint4 row loads); it must fall back to
+        dequant + F.linear and still be correct."""
+        _require_native()
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        def fail_if_called(*args, **kwargs):
+            pytest.fail("fused native gemv_4bit must not be used when K % 32 != 0")
+
+        monkeypatch.setattr(_mps_ops, "_gemv_4bit_native", fail_if_called)
+
+        torch.manual_seed(1337)
+        out_features, in_features = 128, 80  # K % 32 == 16
+        A = torch.randn(1, 1, in_features, dtype=torch.float32)
+        B = torch.randn(out_features, in_features, dtype=torch.float32)
+        B_q, absmax = torch.ops.bitsandbytes.quantize_4bit(B, 64, "nf4", torch.uint8)
+        code = F.get_4bit_type("nf4", device="cpu", blocksize=64)
+
+        out_cpu = torch.ops.bitsandbytes.gemv_4bit(A, B_q, B.shape, absmax, code, 64)
+        out_mps = torch.ops.bitsandbytes.gemv_4bit(
+            A.to("mps"), B_q.to("mps"), B.shape, absmax.to("mps"), code.to("mps"), 64
+        )
+        assert_parity(out_mps, out_cpu, torch.float32)
+
     @pytest.mark.parametrize(
         "op",
-        ["quantize_blockwise", "dequantize_blockwise", "quantize_4bit", "dequantize_4bit"],
+        ["quantize_blockwise", "dequantize_blockwise", "quantize_4bit", "dequantize_4bit", "gemv_4bit"],
     )
     def test_graceful_fallback_when_native_absent(self, monkeypatch, op):
         """With the native handle forced off, every graduated op still works (pure-torch)."""
@@ -326,13 +392,22 @@ class TestNativeMetalPath:
             q_mps, am_mps = torch.ops.bitsandbytes.quantize_4bit(A.to("mps"), 64, "nf4", torch.uint8)
             assert_bit_exact(q_mps, q_cpu)
             assert_parity(am_mps, am_cpu, torch.float32)
-        else:  # dequantize_4bit
+        elif op == "dequantize_4bit":
             q, am = torch.ops.bitsandbytes.quantize_4bit(A, 64, "nf4", torch.uint8)
             d_cpu = torch.ops.bitsandbytes.dequantize_4bit(q, am, 64, "nf4", (256, 256), torch.float32)
             d_mps = torch.ops.bitsandbytes.dequantize_4bit(
                 q.to("mps"), am.to("mps"), 64, "nf4", (256, 256), torch.float32
             )
             assert_parity(d_mps, d_cpu, torch.float32)
+        else:  # gemv_4bit
+            Av = torch.randn(1, 1, 256, dtype=torch.float32)
+            q, am = torch.ops.bitsandbytes.quantize_4bit(A, 64, "nf4", torch.uint8)
+            code4 = F.get_4bit_type("nf4", device="cpu", blocksize=64)
+            o_cpu = torch.ops.bitsandbytes.gemv_4bit(Av, q, (256, 256), am, code4, 64)
+            o_mps = torch.ops.bitsandbytes.gemv_4bit(
+                Av.to("mps"), q.to("mps"), (256, 256), am.to("mps"), code4.to("mps"), 64
+            )
+            assert_parity(o_mps, o_cpu, torch.float32)
 
 
 class Test4bitParity:

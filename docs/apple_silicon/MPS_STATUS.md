@@ -409,6 +409,21 @@ on that materialized `B_dq`. Bench scripts: `scratchpad/bench_matmul_baseline.py
 - Small-M `gemm` (≤64) is still dequant-bound and behaves like gemv; a fused path helps there too, but
   M3 defaults to Option A for simplicity and lets the fixed dequant floor stand.
 
+> **Phase M2 result (2026-07-14, short note — full docs in Phase M4):** `gemv_4bit` now runs through
+> a fused native Metal kernel (`gemv_4bit_fp32/fp16/bf16` in `csrc/mps_kernels.metal`): one
+> SIMD-group per output element, uint4 loads of packed B, in-register nf4/fp4 dequant (weights
+> rounded to the activation dtype, matching the oracle's `B_dq.to(dtype)`), fp32 fma accumulation
+> with split accumulators, `simd_sum` reduction. B_dq is never materialized. Parity: all
+> `test_mps_parity.py -k gemv` green under `BNB_MPS_REQUIRE_NATIVE=1` (native asserted via spy);
+> fallback preserved (K % 32 != 0 and native-absent paths tested). Wall-clock vs the dequant+
+> `F.linear` baseline (nf4/bs64, 50 iters): **3.4–6.2x** across fp16/bf16/fp32 on the M1 shapes
+> (e.g. fp16 4096x4096: 0.31ms vs 1.64ms; 11008x4096: 0.51ms vs 1.76ms). Kernel-only GPU time
+> (`BNB_MPS_PROFILE=1`, `GPUStartTime/GPUEndTime`): ~0.11ms for the ~25 MB shapes when the GPU is
+> clocked up ≈ **~230 GB/s** effective read (vs the standalone dequant kernel's ~54 GB/s); DVFS
+> makes idle-gapped calls read ~75 GB/s, and the per-call cross-queue sync + blocking wait
+> (~0.15–0.25ms, the Phase-2 discipline) now dominates wall-clock at these sizes. Bench:
+> `benchmarks_wip/bench_gemv_fused.py`.
+
 **Load-bearing caveat for the kernel author.** The existing dequant kernel moves ~40 MB in ~0.75ms ≈
 **54 GB/s**, on hardware that sustains ~400 GB/s — it's leaving ~85% of memory bandwidth on the floor.
 Both matmul routes inherit this: a fused `gemv` kernel that reads packed B no faster than the current

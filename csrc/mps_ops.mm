@@ -228,6 +228,55 @@ extern "C" void bnb_mps_dequantize_4bit(void* code, void* A, void* absmax, void*
     }
 }
 
+// gemv_4bit (fused dequant + matrix-vector multiply): code (float32[16]), B (uint8 packed,
+// N*K/2 bytes), absmax (float32[blocks]), A (K elements of the activation dtype) ->
+// out (N elements of the activation dtype). One threadgroup of 32 threads (one SIMD-group)
+// per output element. The Python caller guarantees K % 32 == 0 and passes
+// bs_shift = log2(blocksize); dtype_flag (0 = fp32, 1 = fp16, 2 = bf16) selects the kernel
+// variant, so A and out bind directly in torch's dtype (no cast kernels on the torch queue).
+extern "C" void bnb_mps_gemv_4bit(
+    void* code, void* B, void* absmax, void* A, void* out, int64_t K, int64_t N, int64_t bs_shift, int64_t dtype_flag
+) {
+    @autoreleasepool {
+        NSString* name = @"gemv_4bit_fp32";
+        if (dtype_flag == 1) {
+            name = @"gemv_4bit_fp16";
+        } else if (dtype_flag == 2) {
+            name = @"gemv_4bit_bf16";
+        }
+        id<MTLComputePipelineState> pso = get_pipeline(name);
+        id<MTLCommandBuffer> cb = [get_queue() commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+
+        [enc setBuffer:(__bridge id<MTLBuffer>)code offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)B offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)absmax offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)A offset:0 atIndex:3];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:4];
+
+        uint32_t K32 = (uint32_t)K;
+        uint32_t shift32 = (uint32_t)bs_shift;
+        [enc setBytes:&K32 length:sizeof(K32) atIndex:5];
+        [enc setBytes:&shift32 length:sizeof(shift32) atIndex:6];
+
+        // One SIMD-group per output element n.
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)N, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        // Kernel-only timing probe (BNB_MPS_PROFILE=1): wall-clock around this call includes
+        // the cross-queue sync + encode + blocking wait; GPUStartTime/GPUEndTime isolates the
+        // kernel itself for bandwidth accounting.
+        static const bool profile = getenv("BNB_MPS_PROFILE") != nullptr;
+        if (profile) {
+            const double gpu_ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+            NSLog(@"bnb_mps_gemv_4bit %@ N=%lld K=%lld gpu=%.3fms", name, (long long)N, (long long)K, gpu_ms);
+        }
+    }
+}
+
 // quantize_4bit: bounds (float32[15]), order (uint8[16]), A (float32[n]) ->
 // out (uint8 packed, ceil(n/2)), absmax (float32[blocks]).
 extern "C" void
