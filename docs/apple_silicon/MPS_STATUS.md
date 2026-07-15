@@ -7,9 +7,10 @@
 **Harness:** `tests/test_mps_parity.py` — Phase-1 baseline (no native build): **183 passed, 1 xfailed
 (strict), 0 skipped**. Phase-3 source build (`-DCOMPUTE_BACKEND=mps`, `BNB_MPS_REQUIRE_NATIVE=1`):
 **293 passed, 1 xfailed**, with `quantize_blockwise`, `dequantize_blockwise`, `dequantize_4bit`, and
-`quantize_4bit` all running through hand-written Metal and bit-exact vs the CPU oracle. Phase-M4
-build: **328 passed** plus the known, unrelated lion strict-xfail XPASS (a separate optimizer track;
-see §5), with the 4-bit matmuls native per §11.
+`quantize_4bit` all running through hand-written Metal and bit-exact vs the CPU oracle. Post-M4
+build (`-DCOMPUTE_BACKEND=mps`, `BNB_MPS_REQUIRE_NATIVE=1`): **329 passed, 0 xfailed** — the lion
+weight-decay divergence that was a strict `xfail` is now fixed upstream and is a passing regression
+test (§5), and the 4-bit matmuls are native per §11.
 
 This is the Phase-1 deliverable (§3 audit) plus the Phase-2 result (first native kernel end to end).
 Re-verify against `bitsandbytes/_ops.py` and `bitsandbytes/backends/mps/ops.py` before trusting this
@@ -76,7 +77,7 @@ Parity = max deviation vs the CPU oracle with seeded inputs (see §3 for toleran
 | `int8_scaled_mm`                  | ❌ → `default`                 | composition of the above             | exact                                              |
 | `int8_mixed_scaled_mm`            | ❌ → `default`                 | composition of the above             | covered via components                             |
 | `int8_double_quant`               | ❌ (cuda only, no default)     | **`NotImplementedError`**            | — (gap; also unavailable on cpu)                   |
-| `optimizer_update_32bit`          | ❌ → `default`                 | pure-torch on MPS                    | exact, **except lion + weight_decay (§5)**         |
+| `optimizer_update_32bit`          | ❌ → `default`                 | pure-torch on MPS                    | exact (incl. lion + weight_decay since #1992; §5)  |
 | `optimizer_update_8bit_blockwise` | ❌ (cpu/cuda/xpu, no default)  | **`NotImplementedError`**            | — (gap: 8-bit optimizers unusable on mps)          |
 
 **Round-trip reconstruction** (quantize→dequantize on MPS vs same on CPU, seeded randn,
@@ -143,16 +144,16 @@ Verified against the plan's §1 claims, at `777c145`:
 
 ## 5. Findings / divergences
 
-1. **Lion weight-decay semantics differ between backends** (caught by the harness;
-   encoded as a strict `xfail`, `test_lion_weight_decay_backend_divergence`):
-   - `default` kernel (used on **mps**): **coupled** decay — `g += p * weight_decay`
-     (`backends/default/ops.py`, LION included in `optimizer_id in [0, 1, 2, 4]`).
-   - `cpu` kernel (`backends/cpu/ops.py::_optimizer_update_32bit_cpu`) and the **CUDA
-     kernel** (`csrc/kernels.cu`, `case LION: p_vals[j] *= (1.0f - lr*weight_decay)`):
-     **decoupled** decay, matching the Lion paper.
-   - The `default` backend is the outlier ⇒ candidate upstream bug affecting every
-     device that relies on the default optimizer path (mps included). Out of Phase-1
-     scope to fix; flagged for Eric.
+1. **Lion weight-decay semantics — RESOLVED (was a cross-backend divergence).** The
+   harness caught this in Phase 1 (originally a strict `xfail`): the `default` kernel
+   used on **mps** applied **coupled** decay for lion (`g += p * weight_decay`, LION
+   wrongly included in the coupled group), while the `cpu` and CUDA kernels applied
+   **decoupled** decay (`p *= 1 - lr*weight_decay`) per the Lion paper — the `default`
+   backend was the outlier, a real upstream bug affecting every device on the default
+   optimizer path (mps included). **Fixed upstream (#1992 / #1993):** the default
+   backend now excludes LION from the coupled fold and applies decoupled decay, so mps
+   and the cpu oracle agree. The former xfail is now the passing regression test
+   `test_lion_weight_decay_decoupled_parity`.
 2. **8-bit optimizers are unusable on mps** — `optimizer_update_8bit_blockwise` has no
    mps/default registration and raises `NotImplementedError`.
 3. **`int8_double_quant` is CUDA-only** — raises on mps _and_ on cpu.

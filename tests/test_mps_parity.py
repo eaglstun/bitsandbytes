@@ -929,9 +929,9 @@ class TestOptimizerParity:
     def test_optimizer_update_32bit(self, optimizer_name):
         # On mps this resolves to the "default" (pure-torch) kernel; the cpu oracle
         # runs the dedicated "cpu" kernel from backends/cpu/ops.py.
-        # NOTE: lion is tested with weight_decay=0.0 because the two backends
-        # disagree on lion weight-decay semantics -- see
-        # test_lion_weight_decay_backend_divergence below.
+        # lion + weight_decay>0 parity is covered separately by
+        # test_lion_weight_decay_decoupled_parity below; keep wd=0 here to avoid
+        # redundant coverage.
         weight_decay = 0.0 if optimizer_name == "lion" else 0.01
         (p, state1, state2), (p_mps, state1_mps, state2_mps) = _run_optimizer_32bit_both_devices(
             optimizer_name, weight_decay
@@ -942,14 +942,16 @@ class TestOptimizerParity:
         if state2 is not None:
             assert_parity(state2_mps, state2, torch.float32)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Known cross-backend divergence: the 'default' kernel (used on mps) applies COUPLED "
-        "weight decay for lion (g += p*wd, backends/default/ops.py optimizer_id in [0,1,2,4]), while "
-        "the 'cpu' kernel and the CUDA kernel apply DECOUPLED weight decay (p *= 1 - lr*wd), matching "
-        "the Lion paper. The default backend is the outlier. See docs/apple_silicon/MPS_STATUS.md.",
-    )
-    def test_lion_weight_decay_backend_divergence(self):
+    def test_lion_weight_decay_decoupled_parity(self):
+        """Regression: lion + weight_decay agrees across backends on mps.
+
+        This was previously a strict-xfail documenting a real divergence -- the
+        'default' kernel (used on mps) applied COUPLED weight decay for lion
+        (g += p*wd), while the 'cpu' and CUDA kernels applied DECOUPLED decay
+        (p *= 1 - lr*wd), matching the Lion paper. The default backend was the
+        outlier; it was fixed to be decoupled (#1992 / #1993), so mps and the cpu
+        oracle now match. See docs/apple_silicon/MPS_STATUS.md.
+        """
         (p, state1, _), (p_mps, state1_mps, _) = _run_optimizer_32bit_both_devices("lion", weight_decay=0.01)
 
         assert_parity(p_mps, p, torch.float32)
