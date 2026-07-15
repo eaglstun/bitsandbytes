@@ -182,11 +182,17 @@ bitsandbytes has the following minimum requirements for all platforms:
       <td>⬜ Metal <br><code>mps</code></td>
       <td>Apple M1+</td>
       <td>❌</td>
-      <td>🐢</td>
+      <td>✅ <sup>1</sup></td>
       <td>❌</td>
     </tr>
   </tbody>
 </table>
+
+<small><sup>1</sup> On <code>mps</code>, 4-bit matmul runs on native Metal kernels: a fused gemv for
+inference (M=1) and an <code>MPSMatrixMultiplication</code>-backed GEMM for fp16/fp32 batches. bf16
+batched matmul and other unsupported shapes use a slower dequantize+matmul fallback, and large-batch
+GEMM performs on par with dequantize+matmul. Details:
+<a href="./docs/apple_silicon/README.md">docs/apple_silicon</a>.</small>
 
 ## :book: Documentation
 

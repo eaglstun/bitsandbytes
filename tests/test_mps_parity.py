@@ -181,6 +181,38 @@ class TestNativeMetalPath:
         assert check(ct.c_void_p(0), ct.c_int64(0)) == 0  # null pointer rejected
         assert check(ct.c_void_p(t.data_ptr()), ct.c_int64(10**9)) == 0  # oversize rejected
 
+    def test_view_data_ptr_is_base_plus_offset(self):
+        """Pins the pointer semantics that force the offset-0 clone in _ensure_native_buffer
+        (verified in Phase M4): for an MPS view with storage_offset != 0, data_ptr() is
+        base_ptr + storage_offset * itemsize -- raw pointer arithmetic, NOT an id<MTLBuffer>
+        (casting it would be a miscast; even objc-probing such an interior pointer
+        SIGSEGVs). The base buffer object IS recoverable via untyped_storage().data_ptr(),
+        which is the documented recipe should offset binding ever be implemented. If this
+        test fails, torch changed the contract -- re-verify _ensure_native_buffer before
+        trusting the native ops."""
+        _require_native()
+        import ctypes as ct
+
+        from bitsandbytes.cextension import get_mps_library
+
+        lib = get_mps_library()
+        check = lib._lib.bnb_mps_check_buffer_contract
+
+        base = torch.arange(1024, dtype=torch.float32, device="mps")
+        view = base[128:]
+        torch.mps.synchronize()
+
+        # A view's data_ptr() is base + offset bytes (raw arithmetic, not an objc object)...
+        assert view.storage_offset() == 128
+        assert view.data_ptr() - base.data_ptr() == 128 * base.element_size()
+        # ...while the storage's data_ptr() is the base allocation, which IS the MTLBuffer.
+        storage = view.untyped_storage()
+        assert storage.data_ptr() == base.data_ptr()
+        assert check(ct.c_void_p(storage.data_ptr()), ct.c_int64(storage.nbytes())) == 1
+        # Deliberately NOT calling check() on view.data_ptr(): an interior pointer is not
+        # an objc object, and probing it segfaults (uncatchable by @try/@catch) -- which is
+        # exactly why _ensure_native_buffer must keep cloning offset != 0 views.
+
     @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
     @pytest.mark.parametrize("blocksize", BLOCKSIZES)
     def test_quantize_blockwise_native_bit_exact(self, dtype, blocksize):
@@ -491,6 +523,58 @@ class TestNativeMetalPath:
             A.to("mps"), B_q_mps, list(B.shape), qs_mps.absmax, blocksize, "nf4"
         )
         assert_parity(out_mps, out_cpu, torch.float32)
+
+    def test_sync_discipline_interleave_stress(self):
+        """Race stress for the cross-queue sync discipline (Phase M4). The native matmuls
+        run on a private MTLCommandQueue, so correctness depends on two syncs:
+        (a) torch.mps.synchronize() BEFORE dispatch -- torch's pending writes into A (the
+            in-place copy_ below is enqueued on torch's stream) must be materialized
+            before the native kernel reads A from the other queue;
+        (b) waitUntilCompleted AFTER commit -- out must be complete before torch reads it.
+        Every iteration enqueues a heavy chained matmul and makes the in-place write into
+        A *depend* on it, so torch's write to A lands late on torch's queue; the native
+        kernel on the other queue then reads A. With the pre-sync removed this fails
+        30/30 iterations (verified empirically in Phase M4 by no-op'ing
+        torch.mps.synchronize); with the discipline intact it must pass every time."""
+        _require_native()
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        torch.manual_seed(1337)
+        dtype = torch.float16
+        N, K, blocksize = 1024, 256, 64
+        B = torch.randn(N, K, dtype=dtype)
+        B_q, absmax = torch.ops.bitsandbytes.quantize_4bit(B, blocksize, "nf4", torch.uint8)
+        code = F.get_4bit_type("nf4", device="cpu", blocksize=blocksize)
+        B_q_mps, absmax_mps, code_mps = B_q.to("mps"), absmax.to("mps"), code.to("mps")
+
+        # Long-lived, reused buffers -- every iteration writes into these in place.
+        Av_mps = torch.zeros(1, 1, K, dtype=dtype, device="mps")
+        Am_mps = torch.zeros(8, K, dtype=dtype, device="mps")
+        heavy = torch.randn(2048, 2048, dtype=dtype, device="mps")
+
+        for _ in range(30):
+            # torch-op phase: heavy chained GPU work, then in-place writes (dependent on
+            # that work, so they land late) into the exact buffers the native kernels are
+            # about to read. No explicit sync here -- the op implementations own the
+            # sync discipline.
+            h = heavy
+            for _ in range(4):
+                h = h @ heavy * 1e-4
+            Av_cpu = torch.randn(1, 1, K, dtype=dtype)
+            Am_cpu = torch.randn(8, K, dtype=dtype)
+            Av_mps.copy_(Av_cpu.to("mps") + 0 * h[0, :K])
+            Am_mps.copy_(Am_cpu.to("mps") + 0 * h[:8, :K])
+
+            # native-op phase: fused gemv + native gemm read A from the private queue.
+            out_v_mps = torch.ops.bitsandbytes.gemv_4bit(Av_mps, B_q_mps, B.shape, absmax_mps, code_mps, blocksize)
+            out_m_mps = torch.ops.bitsandbytes.gemm_4bit(Am_mps, B_q_mps, list(B.shape), absmax_mps, blocksize, "nf4")
+
+            # torch-read phase: consume the native outputs on torch's queue immediately.
+            out_v_cpu = torch.ops.bitsandbytes.gemv_4bit(Av_cpu, B_q, B.shape, absmax, code, blocksize)
+            out_m_cpu = torch.ops.bitsandbytes.gemm_4bit(Am_cpu, B_q, list(B.shape), absmax, blocksize, "nf4")
+            assert_parity(out_v_mps * 2.0, out_v_cpu * 2.0, dtype)
+            assert_parity(out_m_mps * 2.0, out_m_cpu * 2.0, dtype)
 
     @pytest.mark.parametrize(
         "op",

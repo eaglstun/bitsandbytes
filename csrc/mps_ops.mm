@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <dlfcn.h>
 #include <libgen.h>
+#include <mach/mach_time.h>
 #include <string>
 
 // Native Metal dispatch layer for the bitsandbytes MPS backend.
@@ -131,6 +132,17 @@ extern "C" int bnb_mps_check_buffer_contract(void* ptr, int64_t min_bytes) {
             return 0;
         }
     }
+}
+
+// Host time in seconds on the mach_absolute_time timebase -- the same clock
+// MTLCommandBuffer's GPUStartTime/GPUEndTime report, so the two are directly comparable.
+// Used only by the BNB_MPS_PROFILE probe.
+static double host_time_s() {
+    static mach_timebase_info_data_t tb = {0, 0};
+    if (tb.denom == 0) {
+        mach_timebase_info(&tb);
+    }
+    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
 }
 
 // One thread per block: cap the threadgroup and dispatch a non-uniform grid, then block on
@@ -264,16 +276,26 @@ extern "C" void bnb_mps_gemv_4bit(
         // One SIMD-group per output element n.
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)N, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [enc endEncoding];
+
+        // Timing probe (BNB_MPS_PROFILE=1): decomposes the blocking call into
+        //   sched = commit -> GPU start (driver/queue scheduling latency)
+        //   gpu   = kernel execution (GPUStartTime..GPUEndTime)
+        //   done  = GPU end -> waitUntilCompleted return (completion delivery)
+        // Wall-clock around the whole ctypes call additionally includes encode (above) and
+        // the caller's torch.mps.synchronize().
+        static const bool profile = getenv("BNB_MPS_PROFILE") != nullptr;
+        const double t_commit = profile ? host_time_s() : 0.0;
         [cb commit];
         [cb waitUntilCompleted];
-
-        // Kernel-only timing probe (BNB_MPS_PROFILE=1): wall-clock around this call includes
-        // the cross-queue sync + encode + blocking wait; GPUStartTime/GPUEndTime isolates the
-        // kernel itself for bandwidth accounting.
-        static const bool profile = getenv("BNB_MPS_PROFILE") != nullptr;
         if (profile) {
+            const double t_done = host_time_s();
+            const double sched_ms = ([cb GPUStartTime] - t_commit) * 1000.0;
             const double gpu_ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
-            NSLog(@"bnb_mps_gemv_4bit %@ N=%lld K=%lld gpu=%.3fms", name, (long long)N, (long long)K, gpu_ms);
+            const double done_ms = (t_done - [cb GPUEndTime]) * 1000.0;
+            NSLog(
+                @"bnb_mps_gemv_4bit %@ N=%lld K=%lld sched=%.3fms gpu=%.3fms done=%.3fms", name, (long long)N,
+                (long long)K, sched_ms, gpu_ms, done_ms
+            );
         }
     }
 }
@@ -427,15 +449,18 @@ extern "C" void bnb_mps_gemm_4bit(
             [enc endEncoding];
         }
 
+        static const bool profile = getenv("BNB_MPS_PROFILE") != nullptr;
+        const double t_commit = profile ? host_time_s() : 0.0;
         [cb commit];
         [cb waitUntilCompleted];
-
-        static const bool profile = getenv("BNB_MPS_PROFILE") != nullptr;
         if (profile) {
+            const double t_done = host_time_s();
+            const double sched_ms = ([cb GPUStartTime] - t_commit) * 1000.0;
             const double gpu_ms = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+            const double done_ms = (t_done - [cb GPUEndTime]) * 1000.0;
             NSLog(
-                @"bnb_mps_gemm_4bit dtype=%lld M=%lld N=%lld K=%lld bias=%d gpu=%.3fms", (long long)dtype_flag,
-                (long long)M, (long long)N, (long long)K, bias ? 1 : 0, gpu_ms
+                @"bnb_mps_gemm_4bit dtype=%lld M=%lld N=%lld K=%lld bias=%d sched=%.3fms gpu=%.3fms done=%.3fms",
+                (long long)dtype_flag, (long long)M, (long long)N, (long long)K, bias ? 1 : 0, sched_ms, gpu_ms, done_ms
             );
         }
     }
