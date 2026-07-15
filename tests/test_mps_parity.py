@@ -1014,17 +1014,57 @@ def _dequant_state(codes, absmax, qmap):
     return torch.ops.bitsandbytes.dequantize_blockwise(codes, absmax, qmap, _OPT8BIT_BLOCKSIZE, torch.float32)
 
 
-class TestOptimizer8bitBlockwiseParity:
-    """Phase O1: optimizer_update_8bit_blockwise runs on mps via the pure-torch
-    "default" kernel and matches the cpu oracle.
+def _run_optimizer_8bit_blockwise_both_devices(optimizer_name: str, dtype: torch.dtype, steps=(1, 2, 3, 4, 5)):
+    """Run the raw op for several steps on cpu and mps from identical seeded inputs.
 
-    The cpu run resolves to the dedicated "cpu" kernel (backends/cpu/ops.py); the
-    mps run resolves to the new device-agnostic "default" kernel
-    (backends/default/ops.py). Both implement the same reference math, so today
-    they agree to fp32 rounding (measured max diff ~5e-7, state codes bit-exact).
-    The assertions are still tolerance-based, NOT bit-exact: the state round-trips
-    through 8-bit quantization, and the Phase-O2 native Metal kernel is allowed to
-    diverge in ulps as long as it stays inside PARITY_TOLERANCE.
+    Returns {device: (p, dequant_state1, dequant_state2, absmax1, absmax2)}.
+    """
+    results = {}
+    for device in ("cpu", "mps"):
+        g, p, state1, state2, qmap1, qmap2, absmax1, absmax2 = _make_optimizer_8bit_inputs(
+            optimizer_name, dtype, device
+        )
+        for step in steps:
+            torch.ops.bitsandbytes.optimizer_update_8bit_blockwise(
+                optimizer_name,
+                g,
+                p,
+                state1,
+                state2,
+                0.9,  # beta1
+                0.999,  # beta2
+                0.9999,  # beta3 (ademamix)
+                5.0,  # alpha (ademamix)
+                1e-8,  # eps
+                step,
+                1e-3,  # lr
+                qmap1,
+                qmap2,
+                absmax1,
+                absmax2,
+                0.01,  # weight_decay
+                1.0,  # gnorm_scale
+            )
+        results[device] = (
+            p,
+            _dequant_state(state1, absmax1, qmap1),
+            _dequant_state(state2, absmax2, qmap2),
+            absmax1,
+            absmax2,
+        )
+    return results
+
+
+class TestOptimizer8bitBlockwiseParity:
+    """Phase O1/O2: optimizer_update_8bit_blockwise runs on mps and matches the cpu oracle.
+
+    The cpu run resolves to the dedicated "cpu" kernel (backends/cpu/ops.py). The mps run
+    resolves to the "mps" registration: the fused native Metal kernel for adam/lion when the
+    native library is built (Phase O2), else the device-agnostic pure-torch "default" kernel
+    (Phase O1) -- which also remains the fallback for the other optimizers. All implement the
+    same reference math. The assertions are tolerance-based, NOT bit-exact: the state
+    round-trips through 8-bit quantization, and the native Metal kernel is allowed to diverge
+    in ulps (fp32-internal, -fno-fast-math) as long as it stays inside PARITY_TOLERANCE.
     """
 
     @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
@@ -1032,39 +1072,7 @@ class TestOptimizer8bitBlockwiseParity:
         "optimizer_name", ["adam", "momentum", "rmsprop", "lion", "adagrad", "ademamix"], ids=id_formatter("opt")
     )
     def test_optimizer_update_8bit_blockwise(self, optimizer_name, dtype):
-        results = {}
-        for device in ("cpu", "mps"):
-            g, p, state1, state2, qmap1, qmap2, absmax1, absmax2 = _make_optimizer_8bit_inputs(
-                optimizer_name, dtype, device
-            )
-            for step in (1, 2, 3, 4, 5):
-                torch.ops.bitsandbytes.optimizer_update_8bit_blockwise(
-                    optimizer_name,
-                    g,
-                    p,
-                    state1,
-                    state2,
-                    0.9,  # beta1
-                    0.999,  # beta2
-                    0.9999,  # beta3 (ademamix)
-                    5.0,  # alpha (ademamix)
-                    1e-8,  # eps
-                    step,
-                    1e-3,  # lr
-                    qmap1,
-                    qmap2,
-                    absmax1,
-                    absmax2,
-                    0.01,  # weight_decay
-                    1.0,  # gnorm_scale
-                )
-            results[device] = (
-                p,
-                _dequant_state(state1, absmax1, qmap1),
-                _dequant_state(state2, absmax2, qmap2),
-                absmax1,
-                absmax2,
-            )
+        results = _run_optimizer_8bit_blockwise_both_devices(optimizer_name, dtype)
 
         p_cpu, s1_cpu, s2_cpu, am1_cpu, am2_cpu = results["cpu"]
         p_mps, s1_mps, s2_mps, am1_mps, am2_mps = results["mps"]
@@ -1114,6 +1122,63 @@ class TestOptimizer8bitBlockwiseParity:
 
         p_cpu, s1_cpu, am1_cpu = results["cpu"]
         p_mps, s1_mps, am1_mps = results["mps"]
+
+        assert_parity(p_mps, p_cpu, torch.float32)
+        assert_parity(s1_mps, s1_cpu, torch.float32)
+        assert_parity(am1_mps, am1_cpu, torch.float32)
+
+    # ---- Phase O2: fused native Metal kernel (adam + lion) ----
+
+    @pytest.mark.parametrize("dtype", FLOAT_DTYPES, ids=describe_dtype)
+    @pytest.mark.parametrize("optimizer_name", ["adam", "lion"], ids=id_formatter("opt"))
+    def test_optimizer_8bit_native_fused(self, optimizer_name, dtype, monkeypatch):
+        """adam/lion route through the fused native Metal kernel (asserted via a spy, not
+        assumed -- mirrors test_gemv_4bit_native_fused) and match the cpu oracle within the
+        documented per-dtype tolerances. fp32 is the meaningful gate: the fp16/bf16
+        tolerances are loose enough to hide update-math bugs, the fp32 ones are not."""
+        _require_native()
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        calls = []
+        orig = _mps_ops._optimizer_update_8bit_blockwise_native
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return orig(*args, **kwargs)
+
+        monkeypatch.setattr(_mps_ops, "_optimizer_update_8bit_blockwise_native", spy)
+
+        results = _run_optimizer_8bit_blockwise_both_devices(optimizer_name, dtype)
+
+        assert calls, f"{optimizer_name} did not route through the fused native Metal optimizer kernel"
+
+        p_cpu, s1_cpu, s2_cpu, am1_cpu, am2_cpu = results["cpu"]
+        p_mps, s1_mps, s2_mps, am1_mps, am2_mps = results["mps"]
+
+        assert_parity(p_mps, p_cpu, dtype)
+        assert_parity(s1_mps, s1_cpu, dtype)
+        assert_parity(am1_mps, am1_cpu, torch.float32)
+        if s2_cpu is not None:
+            assert_parity(s2_mps, s2_cpu, dtype)
+            assert_parity(am2_mps, am2_cpu, torch.float32)
+
+    @pytest.mark.parametrize("optimizer_name", ["momentum", "rmsprop", "adagrad", "ademamix"], ids=id_formatter("opt"))
+    def test_optimizer_8bit_unsupported_uses_fallback(self, optimizer_name, monkeypatch):
+        """Optimizers without a native path must NOT touch the native kernel; they take the
+        O1 pure-torch default impl and still match the cpu oracle (fallback never regresses)."""
+        if _mps_ops is None:
+            pytest.skip("mps backend ops not importable.")
+
+        def fail_if_called(*args, **kwargs):
+            pytest.fail(f"native optimizer kernel must not be used for {optimizer_name}")
+
+        monkeypatch.setattr(_mps_ops, "_optimizer_update_8bit_blockwise_native", fail_if_called)
+
+        results = _run_optimizer_8bit_blockwise_both_devices(optimizer_name, torch.float32)
+
+        p_cpu, s1_cpu, _, am1_cpu, _ = results["cpu"]
+        p_mps, s1_mps, _, am1_mps, _ = results["mps"]
 
         assert_parity(p_mps, p_cpu, torch.float32)
         assert_parity(s1_mps, s1_cpu, torch.float32)

@@ -466,6 +466,87 @@ extern "C" void bnb_mps_gemm_4bit(
     }
 }
 
+// Scalar parameter block for the fused 8-bit optimizer kernel. Must match the MSL
+// `OptParams` struct field-for-field (all 4-byte members, no padding).
+struct BnbOptParams {
+    uint32_t n;
+    uint32_t optimizer_id;
+    float beta1;
+    float one_minus_beta1;
+    float beta2;
+    float one_minus_beta2;
+    float eps;
+    float correction2;
+    float update_scale;
+    float wd_factor;
+    float gnorm_scale;
+};
+
+// optimizer_update_8bit_blockwise (fused dequant-state -> optimizer update -> requant-state):
+// g/p are the grad/param in the activation dtype (dtype_flag: 0 = fp32, 1 = fp16, 2 = bf16),
+// state1/state2 are uint8 codes, qmap1/qmap2 the 256-entry fp32 dynamic maps, absmax1/absmax2
+// the per-block fp32 maxima (read for dequant, overwritten with the post-update maxima).
+// state2/qmap2/absmax2 may be NULL for 1-state optimizers (lion); the state1-side buffers are
+// bound as placeholders and never dereferenced. optimizer_id: 3 = adam, 4 = lion. The float
+// scalars are precomputed on the Python side in double precision (bias corrections, 1-beta,
+// wd factor) so the kernel sees exactly the fp32 values torch's own kernels see.
+// One threadgroup of 256 threads per state block; ONE command buffer, blocking wait.
+extern "C" void bnb_mps_optimizer_update_8bit_blockwise(
+    void* g, void* p, void* state1, void* state2, void* qmap1, void* qmap2, void* absmax1, void* absmax2, int64_t n,
+    int64_t optimizer_id, int64_t dtype_flag, float beta1, float one_minus_beta1, float beta2, float one_minus_beta2,
+    float eps, float correction2, float update_scale, float wd_factor, float gnorm_scale
+) {
+    @autoreleasepool {
+        NSString* name = @"optimizer_update_8bit_blockwise_fp32";
+        if (dtype_flag == 1) {
+            name = @"optimizer_update_8bit_blockwise_fp16";
+        } else if (dtype_flag == 2) {
+            name = @"optimizer_update_8bit_blockwise_bf16";
+        }
+        id<MTLComputePipelineState> pso = get_pipeline(name);
+        if (pso.maxTotalThreadsPerThreadgroup < 256) {
+            NSLog(
+                @"bitsandbytes: %@ supports only %lu threads/threadgroup (need 256)", name,
+                (unsigned long)pso.maxTotalThreadsPerThreadgroup
+            );
+            abort();
+        }
+
+        id<MTLCommandBuffer> cb = [get_queue() commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+
+        [enc setBuffer:(__bridge id<MTLBuffer>)g offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)state1 offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)(state2 ? state2 : state1) offset:0 atIndex:3];
+        [enc setBuffer:(__bridge id<MTLBuffer>)qmap1 offset:0 atIndex:4];
+        [enc setBuffer:(__bridge id<MTLBuffer>)(qmap2 ? qmap2 : qmap1) offset:0 atIndex:5];
+        [enc setBuffer:(__bridge id<MTLBuffer>)absmax1 offset:0 atIndex:6];
+        [enc setBuffer:(__bridge id<MTLBuffer>)(absmax2 ? absmax2 : absmax1) offset:0 atIndex:7];
+
+        BnbOptParams prm;
+        prm.n = (uint32_t)n;
+        prm.optimizer_id = (uint32_t)optimizer_id;
+        prm.beta1 = beta1;
+        prm.one_minus_beta1 = one_minus_beta1;
+        prm.beta2 = beta2;
+        prm.one_minus_beta2 = one_minus_beta2;
+        prm.eps = eps;
+        prm.correction2 = correction2;
+        prm.update_scale = update_scale;
+        prm.wd_factor = wd_factor;
+        prm.gnorm_scale = gnorm_scale;
+        [enc setBytes:&prm length:sizeof(prm) atIndex:8];
+
+        const int64_t blocks = (n + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+}
+
 // quantize_4bit: bounds (float32[15]), order (uint8[16]), A (float32[n]) ->
 // out (uint8 packed, ceil(n/2)), absmax (float32[blocks]).
 extern "C" void

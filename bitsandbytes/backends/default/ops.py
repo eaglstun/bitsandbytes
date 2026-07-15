@@ -646,8 +646,7 @@ def _quantize_state_inplace(
     absmax_out.copy_(absmax)
 
 
-@register_kernel("bitsandbytes::optimizer_update_8bit_blockwise", "default")
-def _(
+def _optimizer_update_8bit_blockwise_default(
     optimizer_name: str,
     g: torch.Tensor,
     p: torch.Tensor,
@@ -772,3 +771,9 @@ def _(
         _quantize_state_inplace(state1_fp32, qmap1, state1, absmax1, blocksize)
         if state2_fp32 is not None:
             _quantize_state_inplace(state2_fp32, qmap2, state2, absmax2, blocksize)
+
+
+# Named (not `def _`) so the mps backend can import it as its fallback / parity oracle.
+# Registered explicit-call style: torch's register_kernel decorator form binds the name to
+# None, which would break the import.
+register_kernel("bitsandbytes::optimizer_update_8bit_blockwise", "default")(_optimizer_update_8bit_blockwise_default)

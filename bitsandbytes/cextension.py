@@ -213,6 +213,31 @@ class MpsBNBNativeLibrary(BNBNativeLibrary):
                 ct.c_int64,  # dtype_flag (0=fp32, 1=fp16; MPSMatrixMultiplication has no bf16)
             ]
 
+        if hasattr(lib, "bnb_mps_optimizer_update_8bit_blockwise"):
+            lib.bnb_mps_optimizer_update_8bit_blockwise.restype = None
+            lib.bnb_mps_optimizer_update_8bit_blockwise.argtypes = [
+                ct.c_void_p,  # g (grad, activation dtype [n])
+                ct.c_void_p,  # p (param, activation dtype [n]; updated in place)
+                ct.c_void_p,  # state1 (uint8 codes [n]; requantized in place)
+                ct.c_void_p,  # state2 (uint8 codes [n]; None for 1-state optimizers)
+                ct.c_void_p,  # qmap1 (float32[256])
+                ct.c_void_p,  # qmap2 (float32[256]; None for 1-state optimizers)
+                ct.c_void_p,  # absmax1 (float32[blocks]; overwritten with post-update maxima)
+                ct.c_void_p,  # absmax2 (float32[blocks]; None for 1-state optimizers)
+                ct.c_int64,  # n
+                ct.c_int64,  # optimizer_id (3=adam, 4=lion)
+                ct.c_int64,  # dtype_flag (0=fp32, 1=fp16, 2=bf16)
+                ct.c_float,  # beta1
+                ct.c_float,  # 1 - beta1 (host-computed in double)
+                ct.c_float,  # beta2
+                ct.c_float,  # 1 - beta2
+                ct.c_float,  # eps
+                ct.c_float,  # correction2 = sqrt(1 - beta2^step) (adam; 1.0 for lion)
+                ct.c_float,  # update_scale (adam: -lr/(1 - beta1^step); lion: -lr)
+                ct.c_float,  # wd_factor = 1 - lr*weight_decay (1.0 when weight_decay == 0)
+                ct.c_float,  # gnorm_scale
+            ]
+
     def verify_buffer_contract(self) -> None:
         """Verify the undocumented torch contract that an MPS tensor's data_ptr() is its
         id<MTLBuffer>. Raises RuntimeError if a future torch has broken it, so callers can

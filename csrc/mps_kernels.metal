@@ -300,6 +300,187 @@ BNB_DEQUANT_4BIT_CHUNKED_KERNEL(dequantize_4bit_chunked_fp16, half)
 BNB_GEMM_BIAS_ADD_KERNEL(gemm_bias_add_fp32, float)
 BNB_GEMM_BIAS_ADD_KERNEL(gemm_bias_add_fp16, half)
 
+// ---- Phase O2: fused 8-bit blockwise optimizer update (adam, lion) ----
+// One threadgroup per 256-element state block (blocksize is fixed at 256 by the op
+// contract). Each thread owns one element: it dequantizes the block's optimizer state via
+// qmap + per-block absmax (the dequantize_blockwise math above), applies the optimizer
+// update in fp32 (matching backends/default/ops.py::_optimizer_update_8bit_blockwise_default,
+// the O1 oracle: decoupled weight decay for adam/lion, adam bias corrections precomputed on
+// the host in double and passed as fp32 -- exactly the scalars torch's kernels see), then
+// requantizes the updated state in place: a simd_max + threadgroup reduction produces the
+// NEW per-block absmax, and each value is bucketed into the 256-entry qmap with the same
+// midpoint binary search as quantize_blockwise (including the full-block reciprocal-multiply
+// vs tail-block direct-divide asymmetry). Built -fno-fast-math like everything else, so the
+// fp32 arithmetic tracks the oracle to ulps.
+
+struct OptParams {
+    uint n;
+    uint optimizer_id;      // mirrors cpu/triton ids: 3 = adam, 4 = lion
+    float beta1;
+    float one_minus_beta1;  // host-computed in double, rounded to fp32 (matches torch scalars)
+    float beta2;
+    float one_minus_beta2;
+    float eps;
+    float correction2;    // adam: sqrt(1 - beta2^step); lion: 1.0 (unused)
+    float update_scale;   // adam: -lr / (1 - beta1^step); lion: -lr
+    float wd_factor;      // 1 - lr*weight_decay (exactly 1.0 when weight_decay == 0)
+    float gnorm_scale;
+};
+
+// Requantize one 256-element state block in place: new per-block absmax via reduction, then
+// bucket each value into the qmap. `scratch` must hold one float per simdgroup. The leading
+// device-scope barrier guarantees every thread's dequant READ of the old absmax/codes has
+// completed before the new values are written (threads in other simdgroups may otherwise
+// still be reading when tid 0 writes), and doubles as the reuse fence for `scratch`.
+static inline void requantize_state_block(
+    float value,
+    bool valid,
+    bool is_tail,
+    device const float* qmap,
+    device uchar* codes,
+    device float* absmax_out,
+    uint idx,
+    uint block_id,
+    uint tid,
+    uint simd_lane,
+    uint simd_group,
+    uint n_simdgroups,
+    threadgroup float* scratch) {
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    const float sm = simd_max(valid ? fabs(value) : 0.0f);
+    if (simd_lane == 0) {
+        scratch[simd_group] = sm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float amax = 0.0f;
+    for (uint i = 0; i < n_simdgroups; ++i) {
+        amax = fmax(amax, scratch[i]);
+    }
+
+    // Same full/tail asymmetry as quantize_blockwise (see the header comment at the top).
+    const float stored = is_tail ? fmax(amax, 1e-38f) : amax;
+    if (tid == 0) {
+        absmax_out[block_id] = stored;
+    }
+    if (!valid) {
+        return;
+    }
+
+    const float inv = 1.0f / fmax(amax, 1e-38f);
+    const float scaled = clamp(is_tail ? (value / stored) : (value * inv), -1.0f, 1.0f);
+    uint lo = 0;
+    uint hi = 255;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1;
+        const float bound = (qmap[mid] + qmap[mid + 1]) * 0.5f;
+        if (bound < scaled) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    codes[idx] = (uchar)lo;
+}
+
+template <typename T>
+static inline void optimizer_update_8bit_blockwise_body(
+    device const T* g,
+    device T* p,
+    device uchar* state1,
+    device uchar* state2,
+    device const float* qmap1,
+    device const float* qmap2,
+    device float* absmax1,
+    device float* absmax2,
+    constant OptParams& prm,
+    uint block_id,
+    uint tid,
+    uint simd_lane,
+    uint simd_group,
+    uint n_simdgroups,
+    threadgroup float* scratch) {
+    const uint start = block_id * 256u;
+    const uint idx = start + tid;
+    const bool valid = idx < prm.n;
+    const bool is_tail = start + 256u > prm.n;
+    const bool is_adam = prm.optimizer_id == 3u;  // uniform: safe around barriers
+
+    // Dequantize state + load grad/param in fp32 (grad = g * gnorm_scale, like the oracle).
+    float grad = 0.0f;
+    float pv = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    if (valid) {
+        grad = (float)g[idx] * prm.gnorm_scale;
+        pv = (float)p[idx];
+        s1 = qmap1[state1[idx]] * absmax1[block_id];
+        if (is_adam) {
+            s2 = qmap2[state2[idx]] * absmax2[block_id];
+        }
+    }
+
+    if (is_adam) {
+        // m = m*beta1 + (1-beta1)*grad; v = v*beta2 + (1-beta2)*grad^2
+        s1 = s1 * prm.beta1 + prm.one_minus_beta1 * grad;
+        s2 = s2 * prm.beta2 + prm.one_minus_beta2 * (grad * grad);
+        // p = p*(1 - lr*wd) - lr/correction1 * m / (sqrt(v)/correction2 + eps)
+        const float denom = sqrt(s2) / prm.correction2 + prm.eps;
+        pv = pv * prm.wd_factor;
+        pv = pv + prm.update_scale * (s1 / denom);
+    } else {  // lion (optimizer_id 4)
+        // p = p*(1 - lr*wd) - lr * sign(m*beta1 + (1-beta1)*grad); m = m*beta2 + (1-beta2)*grad
+        pv = pv * prm.wd_factor;
+        const float u = s1 * prm.beta1 + prm.one_minus_beta1 * grad;
+        pv = pv + prm.update_scale * sign(u);
+        s1 = s1 * prm.beta2 + prm.one_minus_beta2 * grad;
+    }
+
+    if (valid) {
+        p[idx] = (T)pv;
+    }
+
+    requantize_state_block(
+        s1, valid, is_tail, qmap1, state1, absmax1, idx, block_id, tid, simd_lane, simd_group, n_simdgroups, scratch
+    );
+    if (is_adam) {
+        requantize_state_block(
+            s2, valid, is_tail, qmap2, state2, absmax2, idx, block_id, tid, simd_lane, simd_group, n_simdgroups,
+            scratch
+        );
+    }
+}
+
+// For 1-state optimizers (lion) the dispatcher binds the state1/qmap1/absmax1 buffers to the
+// state2 slots as placeholders; they are never dereferenced (optimizer_id != 3).
+#define BNB_OPTIMIZER_UPDATE_8BIT_KERNEL(NAME, T)                                                                     \
+    kernel void NAME(                                                                                                \
+        device const T* g [[buffer(0)]],                                                                             \
+        device T* p [[buffer(1)]],                                                                                   \
+        device uchar* state1 [[buffer(2)]],                                                                          \
+        device uchar* state2 [[buffer(3)]],                                                                          \
+        device const float* qmap1 [[buffer(4)]],  /* 256-entry signed dynamic map */                                 \
+        device const float* qmap2 [[buffer(5)]],  /* 256-entry unsigned dynamic map */                               \
+        device float* absmax1 [[buffer(6)]],                                                                         \
+        device float* absmax2 [[buffer(7)]],                                                                         \
+        constant OptParams& prm [[buffer(8)]],                                                                       \
+        uint block_id [[threadgroup_position_in_grid]],                                                              \
+        uint tid [[thread_position_in_threadgroup]],                                                                 \
+        uint simd_lane [[thread_index_in_simdgroup]],                                                                \
+        uint simd_group [[simdgroup_index_in_threadgroup]],                                                          \
+        uint n_simdgroups [[simdgroups_per_threadgroup]]) {                                                          \
+        threadgroup float scratch[32];                                                                               \
+        optimizer_update_8bit_blockwise_body<T>(                                                                     \
+            g, p, state1, state2, qmap1, qmap2, absmax1, absmax2, prm, block_id, tid, simd_lane, simd_group,          \
+            n_simdgroups, scratch                                                                                    \
+        );                                                                                                           \
+    }
+
+BNB_OPTIMIZER_UPDATE_8BIT_KERNEL(optimizer_update_8bit_blockwise_fp32, float)
+BNB_OPTIMIZER_UPDATE_8BIT_KERNEL(optimizer_update_8bit_blockwise_fp16, half)
+BNB_OPTIMIZER_UPDATE_8BIT_KERNEL(optimizer_update_8bit_blockwise_bf16, bfloat)
+
 // ---- 4-bit blockwise quantize (NF4/FP4): A (float32) -> packed out + absmax ----
 // `bounds` are the 15 midpoints of the SORTED 16-entry code; `order` maps the searchsorted
 // index back to the stored 4-bit index (identity for NF4, the argsort remap for FP4).

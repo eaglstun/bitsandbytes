@@ -61,24 +61,24 @@ Three tiers, checked in order by the torch dispatcher:
 
 Parity = max deviation vs the CPU oracle with seeded inputs (see §3 for tolerances).
 
-| Op (`bitsandbytes::…`)            | `mps` reg?                     | Path that runs here                  | Parity vs CPU oracle                                                     |
-| --------------------------------- | ------------------------------ | ------------------------------------ | ------------------------------------------------------------------------ |
-| `quantize_blockwise`              | ✅ **native Metal** (P2)       | hand-written kernel (fallback avail) | codes **bit-exact**, absmax **bit-exact**                                |
-| `dequantize_blockwise`            | ✅ **native Metal** (P3)       | hand-written kernel (fallback avail) | **bit-exact** all dtypes/blocksizes                                      |
-| `dequantize_blockwise.out`        | ❌ (cuda/xpu only, no default) | **`NotImplementedError`**            | — (gap)                                                                  |
-| `quantize_4bit`                   | ✅ **native Metal** (P3)       | hand-written kernel (fallback avail) | packed nibbles **bit-exact**, absmax **bit-exact**                       |
-| `dequantize_4bit` (+`.out`)       | ✅ **native Metal** (P3)       | hand-written kernel (fallback avail) | **bit-exact** all dtypes/blocksizes                                      |
-| `gemv_4bit` (+`.out`)             | ✅ **native Metal** (M2)       | fused dequant+dot kernel (§11.1)     | within per-dtype tolerances (§3); fallback avail                         |
-| `gemm_4bit`                       | ✅ **native Metal** (M3)       | dequant→scratch + MPSMatMul (§11.2)  | within per-dtype tolerances; **bf16 → fallback**                         |
-| `int8_linear_matmul` (+`.out`)    | ❌ → `default`                 | fp32 matmul on MPS                   | exact (int32)                                                            |
-| `int8_vectorwise_quant`           | ❌ → `default`                 | pure-torch on MPS                    | exact (incl. outlier extraction, threshold=6)                            |
-| `int8_vectorwise_dequant`         | ❌ → `default`                 | pure-torch on MPS                    | exact                                                                    |
-| `int8_mm_dequant`                 | ❌ → `default`                 | pure-torch on MPS                    | exact                                                                    |
-| `int8_scaled_mm`                  | ❌ → `default`                 | composition of the above             | exact                                                                    |
-| `int8_mixed_scaled_mm`            | ❌ → `default`                 | composition of the above             | covered via components                                                   |
-| `int8_double_quant`               | ❌ (cuda only, no default)     | **`NotImplementedError`**            | — (gap; also unavailable on cpu)                                         |
-| `optimizer_update_32bit`          | ❌ → `default`                 | pure-torch on MPS                    | exact (incl. lion + weight_decay since #1992; §5)                        |
-| `optimizer_update_8bit_blockwise` | ❌ → `default` (Phase O1)      | pure-torch on MPS                    | ≤5e-7 fp32, state codes bit-exact (fp32/fp16); rare ±1 bucket flips bf16 |
+| Op (`bitsandbytes::…`)            | `mps` reg?                     | Path that runs here                                            | Parity vs CPU oracle                                                            |
+| --------------------------------- | ------------------------------ | -------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `quantize_blockwise`              | ✅ **native Metal** (P2)       | hand-written kernel (fallback avail)                           | codes **bit-exact**, absmax **bit-exact**                                       |
+| `dequantize_blockwise`            | ✅ **native Metal** (P3)       | hand-written kernel (fallback avail)                           | **bit-exact** all dtypes/blocksizes                                             |
+| `dequantize_blockwise.out`        | ❌ (cuda/xpu only, no default) | **`NotImplementedError`**                                      | — (gap)                                                                         |
+| `quantize_4bit`                   | ✅ **native Metal** (P3)       | hand-written kernel (fallback avail)                           | packed nibbles **bit-exact**, absmax **bit-exact**                              |
+| `dequantize_4bit` (+`.out`)       | ✅ **native Metal** (P3)       | hand-written kernel (fallback avail)                           | **bit-exact** all dtypes/blocksizes                                             |
+| `gemv_4bit` (+`.out`)             | ✅ **native Metal** (M2)       | fused dequant+dot kernel (§11.1)                               | within per-dtype tolerances (§3); fallback avail                                |
+| `gemm_4bit`                       | ✅ **native Metal** (M3)       | dequant→scratch + MPSMatMul (§11.2)                            | within per-dtype tolerances; **bf16 → fallback**                                |
+| `int8_linear_matmul` (+`.out`)    | ❌ → `default`                 | fp32 matmul on MPS                                             | exact (int32)                                                                   |
+| `int8_vectorwise_quant`           | ❌ → `default`                 | pure-torch on MPS                                              | exact (incl. outlier extraction, threshold=6)                                   |
+| `int8_vectorwise_dequant`         | ❌ → `default`                 | pure-torch on MPS                                              | exact                                                                           |
+| `int8_mm_dequant`                 | ❌ → `default`                 | pure-torch on MPS                                              | exact                                                                           |
+| `int8_scaled_mm`                  | ❌ → `default`                 | composition of the above                                       | exact                                                                           |
+| `int8_mixed_scaled_mm`            | ❌ → `default`                 | composition of the above                                       | covered via components                                                          |
+| `int8_double_quant`               | ❌ (cuda only, no default)     | **`NotImplementedError`**                                      | — (gap; also unavailable on cpu)                                                |
+| `optimizer_update_32bit`          | ❌ → `default`                 | pure-torch on MPS                                              | exact (incl. lion + weight_decay since #1992; §5)                               |
+| `optimizer_update_8bit_blockwise` | ✅ `mps` (Phase O2)            | **native Metal** adam/lion; O1 `default` fallback for the rest | adam fp32 ≤1.2e-7, lion fp32 p bit-exact; 5.4x vs O1 default (4096², adam fp32) |
 
 **Round-trip reconstruction** (quantize→dequantize on MPS vs same on CPU, seeded randn,
 blocksize ∈ {64, 128, 256, 512}, dtypes fp32/fp16/bf16):
@@ -561,3 +561,36 @@ Verified on this build (torch 2.12.1):
   workload actually hits the copy. `test_view_data_ptr_is_base_plus_offset` pins the verified
   semantics so a future torch that changes them fails loudly instead of silently invalidating
   `_ensure_native_buffer`'s premise.
+
+---
+
+## 12. Phase O2 — native fused 8-bit blockwise optimizer kernel (adam + lion)
+
+`optimizer_update_8bit_blockwise` now runs through a fused hand-written Metal kernel on mps
+for **adam** (2-state) and **lion** (1-state); every other optimizer (momentum, rmsprop,
+adagrad, ademamix) falls back to the Phase-O1 pure-torch `default` impl, which stays the
+parity oracle. Kernel design (`csrc/mps_kernels.metal::optimizer_update_8bit_blockwise_*`,
+fp32/fp16/bf16 variants): one threadgroup of 256 threads per state block (blocksize is fixed
+at 256 by the op contract); each thread dequantizes its state element (`qmap[code] * absmax`),
+applies the optimizer update in fp32, then the block requantizes in place — `simd_max` +
+threadgroup reduction for the NEW per-block absmax (device-scope barrier orders the in-place
+absmax read→write), midpoint binary search into the 256-entry qmap for the new code (same
+full-block reciprocal-multiply / tail-block direct-divide asymmetry as `quantize_blockwise`).
+Scalar derivations torch performs in double (1−β, adam bias corrections, −lr/correction1,
+the decoupled weight-decay factor) are computed host-side in double and passed as fp32, so
+the kernel sees exactly the scalars the oracle's torch kernels see.
+
+- **Parity (5 steps, n=4096, vs the cpu reference kernel):** adam fp32 max abs diff ≤1.2e-7
+  across p/state/absmax; lion fp32 p **bit-exact**, state ≤2e-9. fp16/bf16 inside the
+  documented loose tolerances. Negative control verified: a deliberate ×1.1 on the adam
+  p-update (and separately on lion) FAILS the fp32 native-fused parity test (fp16/bf16
+  tolerances do not catch it — fp32 is the gate, as in Phase O1).
+- **Speedup:** 4096×4096 adam fp32, 1.46 ms/iter native vs 7.93 ms/iter O1 pure-torch
+  default → **5.4x** (the default pays multiple torch quant/dequant round-trips per step;
+  the native path is one command buffer, one sync).
+- **Tests:** `TestOptimizer8bitBlockwiseParity::test_optimizer_8bit_native_fused` asserts the
+  native route via a monkeypatch spy (hard requirement under `BNB_MPS_REQUIRE_NATIVE=1`);
+  `test_optimizer_8bit_unsupported_uses_fallback` pins that momentum/rmsprop/adagrad/ademamix
+  never touch the native kernel and still match the oracle.
+- **Phase O3 (next):** extend the kernel's `optimizer_id` switch to momentum/rmsprop/adagrad/
+  ademamix (ademamix needs the stacked `state1=[m1,m2]` / 2-D `absmax1` layout).

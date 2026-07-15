@@ -9,7 +9,7 @@ implemented using pure PyTorch fallbacks.
 """
 
 from collections.abc import Sequence
-from math import prod
+from math import prod, sqrt
 import platform
 from typing import Optional
 
@@ -21,6 +21,7 @@ from ..default.ops import (
     _dequantize_4bit_compute,
     _dequantize_blockwise_compute,
     _get_4bit_quantize_bounds,
+    _optimizer_update_8bit_blockwise_default,
     _try_torch_compile,
 )
 from ..utils import _get_4bit_code
@@ -593,3 +594,205 @@ def _(
     # Fallback: dequantize + linear.
     B_dq = _dequantize_4bit_impl(B, absmax, blocksize, quant_type, shapeB, A.dtype)
     return torch.nn.functional.linear(A, B_dq, bias)
+
+
+# ---- Phase O2: fused native 8-bit blockwise optimizer update (adam, lion) ----
+
+# Mirrors the cpu/triton optimizer_id mapping (MOMENTUM 0, RMSPROP 1, ADAGRAD 2, ADAM 3,
+# LION 4, ADEMAMIX 5); only the ids listed here have a native kernel path (Phase O3 extends).
+_OPT8BIT_NATIVE_OPTIMIZER_IDS = {"adam": 3, "lion": 4}
+_OPT8BIT_DTYPE_FLAGS = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
+
+
+def _optimizer_update_8bit_blockwise_native(
+    optimizer_name: str,
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2: Optional[torch.Tensor],
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float,
+    qmap1: torch.Tensor,
+    qmap2: Optional[torch.Tensor],
+    absmax1: torch.Tensor,
+    absmax2: Optional[torch.Tensor],
+    weight_decay: float,
+    gnorm_scale: float,
+) -> None:
+    """Route optimizer_update_8bit_blockwise (adam/lion) through the fused Metal kernel.
+
+    One threadgroup per 256-element state block: dequantize state (qmap + absmax), run the
+    optimizer update in fp32, reduce the NEW per-block absmax, and requantize the state --
+    all in one kernel, one command buffer, one blocking wait. The scalar derivations that
+    torch computes in double (1 - beta, adam bias corrections, -lr/correction1, the decoupled
+    weight-decay factor) are computed HERE in double and passed down as fp32, so the kernel's
+    fp32 arithmetic sees exactly the scalars the O1 default / cpu oracle sees.
+
+    In-place contract: p, state1, absmax1 (and state2/absmax2 for adam) are mutated. When an
+    input needed a clone to satisfy the native buffer ABI (non-contiguous or nonzero storage
+    offset -- not the case for real optimizer state, which is freshly allocated), the result
+    is copied back.
+    """
+    n = p.numel()
+    two_state = state2 is not None
+
+    g_buf = _ensure_native_buffer(g)
+    p_buf = _ensure_native_buffer(p)
+    s1_buf = _ensure_native_buffer(state1)
+    am1_buf = _ensure_native_buffer(absmax1)
+    qmap1_buf = _ensure_native_buffer(qmap1.to(torch.float32))
+    if two_state:
+        s2_buf = _ensure_native_buffer(state2)
+        am2_buf = _ensure_native_buffer(absmax2)
+        qmap2_buf = _ensure_native_buffer(qmap2.to(torch.float32))
+
+    # Host-side (double precision) scalar derivations, matching the oracle's torch scalars.
+    if optimizer_name == "adam":
+        correction1 = 1.0 - beta1**step
+        correction2 = sqrt(1.0 - beta2**step)
+        update_scale = -lr / correction1
+    else:  # lion
+        correction2 = 1.0
+        update_scale = -lr
+    wd_factor = 1.0 - lr * weight_decay if weight_decay > 0.0 else 1.0
+
+    torch.mps.synchronize()
+    _mps_native.bnb_mps_optimizer_update_8bit_blockwise(
+        g_buf.data_ptr(),
+        p_buf.data_ptr(),
+        s1_buf.data_ptr(),
+        s2_buf.data_ptr() if two_state else None,
+        qmap1_buf.data_ptr(),
+        qmap2_buf.data_ptr() if two_state else None,
+        am1_buf.data_ptr(),
+        am2_buf.data_ptr() if two_state else None,
+        n,
+        _OPT8BIT_NATIVE_OPTIMIZER_IDS[optimizer_name],
+        _OPT8BIT_DTYPE_FLAGS[g.dtype],
+        beta1,
+        1.0 - beta1,
+        beta2,
+        1.0 - beta2,
+        eps,
+        correction2,
+        update_scale,
+        wd_factor,
+        gnorm_scale,
+    )
+
+    # Copy back any buffers the ABI forced us to clone (no-ops in the common case).
+    if p_buf is not p:
+        p.copy_(p_buf)
+    if s1_buf is not state1:
+        state1.copy_(s1_buf)
+    if am1_buf is not absmax1:
+        absmax1.copy_(am1_buf)
+    if two_state:
+        if s2_buf is not state2:
+            state2.copy_(s2_buf)
+        if am2_buf is not absmax2:
+            absmax2.copy_(am2_buf)
+
+
+@register_kernel("bitsandbytes::optimizer_update_8bit_blockwise", "mps")
+def _(
+    optimizer_name: str,
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2: Optional[torch.Tensor],
+    beta1: float,
+    beta2: float,
+    beta3: float,
+    alpha: float,
+    eps: float,
+    step: int,
+    lr: float,
+    qmap1: torch.Tensor,
+    qmap2: Optional[torch.Tensor],
+    absmax1: torch.Tensor,
+    absmax2: Optional[torch.Tensor],
+    weight_decay: float,
+    gnorm_scale: float,
+    skip_zeros: bool = False,
+) -> None:
+    # Native fused Metal kernel for adam (2-state) and lion (1-state); everything else falls
+    # back to the O1 device-agnostic default impl (the parity oracle), which must never
+    # regress. State layout is keyed off ABSMAX ndim, not codes ndim: a 2-D param has 2-D
+    # codes with 1-D absmax, while stacked (ademamix-style) state has 2-D absmax -- the
+    # native path only takes plain 1-D-absmax state.
+    two_state = optimizer_name == "adam"
+    blocks = -(p.numel() // -256)
+    if (
+        _native_available()
+        and hasattr(_mps_native._lib, "bnb_mps_optimizer_update_8bit_blockwise")  # stale dylib guard
+        and optimizer_name in _OPT8BIT_NATIVE_OPTIMIZER_IDS
+        and not skip_zeros
+        and g.dtype in _OPT8BIT_DTYPE_FLAGS
+        and g.dtype == p.dtype
+        and g.numel() == p.numel()
+        and state1.dtype == torch.uint8
+        and state1.numel() == p.numel()
+        and absmax1.ndim == 1
+        and absmax1.dtype == torch.float32
+        and absmax1.numel() == blocks
+        and qmap1.numel() == 256
+        and (
+            (state2 is None and qmap2 is None and absmax2 is None)
+            if not two_state
+            else (
+                state2 is not None
+                and qmap2 is not None
+                and absmax2 is not None
+                and state2.dtype == torch.uint8
+                and state2.numel() == p.numel()
+                and absmax2.ndim == 1
+                and absmax2.dtype == torch.float32
+                and absmax2.numel() == blocks
+                and qmap2.numel() == 256
+            )
+        )
+    ):
+        return _optimizer_update_8bit_blockwise_native(
+            optimizer_name,
+            g,
+            p,
+            state1,
+            state2,
+            beta1,
+            beta2,
+            eps,
+            step,
+            lr,
+            qmap1,
+            qmap2,
+            absmax1,
+            absmax2,
+            weight_decay,
+            gnorm_scale,
+        )
+
+    return _optimizer_update_8bit_blockwise_default(
+        optimizer_name,
+        g,
+        p,
+        state1,
+        state2,
+        beta1,
+        beta2,
+        beta3,
+        alpha,
+        eps,
+        step,
+        lr,
+        qmap1,
+        qmap2,
+        absmax1,
+        absmax2,
+        weight_decay,
+        gnorm_scale,
+        skip_zeros,
+    )
